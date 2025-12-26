@@ -142,7 +142,7 @@ class OpTestSSH():
                + " ssh"
                + " -p %s" % str(self.port)
                + " -l %s %s" % (self.username, self.host)
-               + " -o PubkeyAuthentication=no -o afstokenpassing=no"
+               + " -o PubkeyAuthentication=no"
                )
 
         if not self.check_ssh_keys:

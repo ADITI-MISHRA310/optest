@@ -38,7 +38,7 @@ import time
 import random
 import subprocess
 import re
-import telnetlib
+import telnetlib3
 import socket
 import select
 import pty
@@ -830,6 +830,17 @@ class OpTestHost():
         res = self.host_run_command("lscpu --all -e| wc -l", console=console)
         return int(res[0])/(self.host_get_smt(console=console))
 
+    def host_get_online_cpus(self, console=0):
+
+       '''
+       Get total online cpu count
+       return : cpus
+       type: int
+       '''
+       res = self.host_run_command("lscpu --online -e | wc -l", console=console)
+       return int(res[0])-1
+
+
     def host_gather_debug_logs(self, console=0):
         self.host_run_command(
             "grep ',[0-4]\]' /sys/firmware/opal/msglog", console=console)
@@ -976,6 +987,21 @@ class OpTestHost():
             l_msg = "Executable file %s/%s is not present" % (i_dir, i_file)
             log.debug(l_msg)
             return False
+    def host_check_module_loaded(self, i_module):
+        ''''
+        Function to check kernel module is loaded.
+
+        :params i_module: Name of kernel module
+        :return: True when loaded, else False.
+        :rtype: boolean.
+        '''
+        with open('/proc/modules', 'r') as modules_file:
+            for line in modules_file:
+                module_info = line.split()
+                if module_info[0] == i_module:
+                    return True
+                return False
+
 
 
 class OpTestLPAR(OpTestHost):

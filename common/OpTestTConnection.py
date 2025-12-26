@@ -37,7 +37,7 @@
 # constantly themselves, so in this file we should expect to be given
 # strings and to return strings - even though that makes things harder.
 
-import telnetlib
+import telnetlib3
 
 
 class NoLoginPrompt(Exception):

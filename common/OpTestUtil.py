@@ -33,7 +33,7 @@ import string
 import subprocess
 import random
 import re
-import telnetlib
+import telnetlib3
 import socket
 import select
 import time
@@ -48,11 +48,13 @@ from http.client import HTTPConnection
 # HTTPConnection.debuglevel = 1 # this will print some additional info to stdout
 import urllib3  # setUpChildLogger enables integrated logging with op-test
 import json
+import tempfile
 
 from .OpTestConstants import OpTestConstants as BMC_CONST
 from .OpTestError import OpTestError
 from .Exceptions import CommandFailed, RecoverFailed, ConsoleSettings
 from .Exceptions import HostLocker, AES, ParameterCheck, HTTPCheck, UnexpectedCase
+from .OpTestVIOS import OpTestVIOS
 
 import logging
 import OpTestLogger
@@ -86,6 +88,140 @@ class OpTestUtil():
                                            minutes=None,
                                            proxy=self.build_proxy(self.conf.args.hostlocker_proxy,
                                                                   self.conf.args.hostlocker_no_proxy_ips))
+
+    def is_signed(self, output):
+        if "Module signature appended" in output[0]:
+            return True
+        return False
+
+    def check_kernel_signature(self):
+        '''
+        Check whether the kernel is signed or unsigned.
+        If, string - "Module signature appended" is found,
+        then the kernel is signed, else, the kernel is unsigned.
+        '''
+        vmlinux = "vmlinuz"  # RHEL
+        if self.distro_name() == 'sles' or self.distro_name() == "suse":
+            vmlinux = "vmlinux"
+
+        cmd = "strings /boot/%s-$(uname -r) | tail -1" % vmlinux
+        output = self.conf.host().host_run_command(cmd)
+        if self.is_signed(output):
+            return True
+        return False
+
+    def get_grub_file(self):
+        '''
+        Fetch the grub-file based on the distro
+        '''
+        if self.distro_name() == 'rhel':
+            rpm_name = "grub2-ppc64le"
+            filename = "core.elf"
+        elif self.distro_name() == 'suse' or self.distro_name() == 'sles':
+            rpm_name = "grub2-powerpc-ieee1275"
+            filename = "grub.elf"
+        else:
+            raise self.skipTest("Test currently supported on SLES and RHEL releases only.")
+
+        cmd = ("rpm -ql %s" % (rpm_name))
+        output = self.conf.host().host_run_command(cmd)
+        for line in output:
+            if filename in line:
+                grub_filename = line
+        if not grub_filename:
+            self.fail("%s: Failed to get grub file" % (self.distro_name()))
+        return grub_filename
+
+    def check_grub_signature(self, grub_filename):
+        '''
+        Check whether the GRUB is signed or unsigned.
+        '''
+        cmd = "strings %s | tail -1" % grub_filename
+        output = self.conf.host().host_run_command(cmd)
+        if self.is_signed(output):
+            return True
+        else:
+            self.fail("Grub is not signed.")
+
+    def check_os_level_secureboot_state(self):
+        '''
+        Check whether the secure-boot is enabled at os level.
+        To do this, check the entry of "00000002" in "/proc/device-tree/ibm,secure-boot" file.
+        If found, then secure-boot is enabled.
+        '''
+        cmd = "lsprop /proc/device-tree/ibm,secure-boot"
+        output = self.conf.host().host_run_command(cmd)
+        for line in output:
+            if '00000002' in line:
+                return True
+        return False
+
+    def getPRePDisk(self):
+        '''
+        Identify the PReP partition, this disk name is required to copy
+        signed grub. This manual step required for RHEL OS only.
+        '''
+        out = self.conf.host().host_run_command('df /boot')
+        for line in out:
+            if "/dev" in line:
+                self.prepDisk = line.split(" ")[0][:-1]+'1'
+                break
+        if not self.prepDisk:
+            return False
+        return True
+
+    def backup_restore_PRepDisk(self, action):
+        if action == "backup":
+            out = self.conf.host().host_run_command("dd if=%s of=%s" % (self.prepDisk, self.backup_prep_filename))
+        if action == "restore":
+            out = self.conf.host().host_run_command("dd if=%s of=%s" % (self.backup_prep_filename, self.prepDisk))
+        for line in out:
+            if "No" in line:
+                return False
+        return True
+
+    def os_secureboot_enable(self, enable=True):
+        '''
+        To enable/disable the Secure Boot at Operating System level.
+        Parameter enable=True for enabling Secure Boot
+        Parameter enable=False for disabling Secure Boot
+        '''
+        self.prepDisk = ""
+        self.backup_prep_filename = "/root/save-prep"
+        self.distro_version = self.get_distro_version()
+        self.kernel_signature = self.check_kernel_signature()
+        self.grub_filename = self.get_grub_file()
+        self.grub_signature = self.check_grub_signature(self.grub_filename)
+
+        if self.kernel_signature == True:
+            if 'rhel' in self.distro_name() and enable:
+                # Get the PReP disk file
+                if not self.getPRePDisk():
+                    return False
+                if not self.backup_restore_PRepDisk(action="backup"):
+                    return False
+                #Proceed ahead only if the grub is signed
+                if self.grub_signature == True:
+                    # Running grub2-install on PReP disk
+                    out = self.conf.host().host_run_command("grub2-install %s" % self.prepDisk)
+                    for line in out:
+                        if "Installation finished. No error reported." not in out:
+                            # Restore the PRep partition back to its original state
+                            self.backup_restore_PRepDisk(action="restore")
+                            return False
+
+                    out = self.conf.host().host_run_command("dd if=%s of=%s; echo $?" % 
+                                             (self.grub_filename, self.prepDisk))
+                    if "0" not in out[3]:
+                        # Restore the PRep partition back to its original state
+                        self.backup_restore_PRepDisk(action="restore")
+                        self.fail("RHEL: Failed to copy to PReP partition")
+            elif 'rhel' in self.distro_name() and not enable:
+                # Nothing to do for Secure Boot disable for RHEL at OS level
+                pass
+        else:
+            return False
+        return True
 
     def check_lockers(self):
         if self.conf.args.hostlocker is not None:
@@ -293,52 +429,68 @@ class OpTestUtil():
             self.conf.util_bmc_server.close()
 
         if self.conf.dump:
-            self.conf.dump = False # possible for multiple passes here
+            self.conf.dump = False  # possible for multiple passes here
             # currently only pulling OpenBMC logs
             marker_time = (time.asctime(time.localtime())).replace(" ", "_")
             if self.conf.args.bmc_type in ['OpenBMC']:
                 try:
-                    self.PingMTUCheck(self.conf.args.bmc_ip, totalSleepTime=BMC_CONST.PING_RETRY_FOR_STABILITY)
+                    self.PingMTUCheck(
+                        self.conf.args.bmc_ip, totalSleepTime=BMC_CONST.PING_RETRY_FOR_STABILITY)
                 except Exception as e:
-                    log.warning("Check that the BMC is healthy, maybe the Broadcom bug, Exception={}".format(e))
+                    log.warning(
+                        "Check that the BMC is healthy, maybe the Broadcom bug, Exception={}".format(e))
                 log.info("OpTestSystem Starting to Gather BMC logs")
                 try:
-                    journal_dmesg_outfile = "op-test-openbmc-journal-dmesg.{}".format(marker_time)
-                    journal_dmesg_entries = self.conf.bmc().run_command("journalctl -k --no-pager >/tmp/{}".format(journal_dmesg_outfile))
-                    journal_outfile = "op-test-openbmc-journal.{}".format(marker_time)
-                    journal_entries = self.conf.bmc().run_command("journalctl --no-pager >/tmp/{}".format(journal_outfile))
+                    journal_dmesg_outfile = "op-test-openbmc-journal-dmesg.{}".format(
+                        marker_time)
+                    journal_dmesg_entries = self.conf.bmc().run_command(
+                        "journalctl -k --no-pager >/tmp/{}".format(journal_dmesg_outfile))
+                    journal_outfile = "op-test-openbmc-journal.{}".format(
+                        marker_time)
+                    journal_entries = self.conf.bmc().run_command(
+                        "journalctl --no-pager >/tmp/{}".format(journal_outfile))
                     top_outfile = "op-test-openbmc-top.{}".format(marker_time)
-                    top_entries = self.conf.bmc().run_command("top -b -n 1 >/tmp/{}".format(top_outfile))
+                    top_entries = self.conf.bmc().run_command(
+                        "top -b -n 1 >/tmp/{}".format(top_outfile))
                     df_outfile = "op-test-openbmc-df.{}".format(marker_time)
                     df_entries = self.conf.bmc().run_command("df -h >/tmp/{}".format(df_outfile))
-                    uptime_outfile = "op-test-openbmc-uptime.{}".format(marker_time)
-                    uptime_entries = self.conf.bmc().run_command("uptime >/tmp/{}".format(uptime_outfile))
-                    console_outfile = "op-test-openbmc-console-log.{}".format(marker_time)
+                    uptime_outfile = "op-test-openbmc-uptime.{}".format(
+                        marker_time)
+                    uptime_entries = self.conf.bmc().run_command(
+                        "uptime >/tmp/{}".format(uptime_outfile))
+                    console_outfile = "op-test-openbmc-console-log.{}".format(
+                        marker_time)
                     # obmc-console.log will exist even if empty
                     console_entries = self.conf.bmc().run_command("cp /var/log/obmc-console.log /tmp/{}"
-                                          .format(console_outfile))
+                                                                  .format(console_outfile))
                     self.copyFilesFromDest(self.conf.args.bmc_username,
-                        self.conf.args.bmc_ip,
-                        "/tmp/op-test*",
-                        self.conf.args.bmc_password,
-                        self.conf.logdir)
+                                           self.conf.args.bmc_ip,
+                                           "/tmp/op-test*",
+                                           self.conf.args.bmc_password,
+                                           self.conf.logdir)
                 except Exception as e:
-                    log.debug("OpTestSystem encountered a problem trying to gather the BMC logs, Exception={}".format(e))
+                    log.debug(
+                        "OpTestSystem encountered a problem trying to gather the BMC logs, Exception={}".format(e))
                 # remove temp files
                 try:
                     self.conf.bmc().run_command("rm /tmp/op-test*")
                 except Exception as e:
-                    log.warning("OpTestSystem encountered a problem cleaning up BMC /tmp files, you may want to check.")
-                log.info("OpTestSystem Completed Gathering BMC logs, find them in the Log Location")
+                    log.warning(
+                        "OpTestSystem encountered a problem cleaning up BMC /tmp files, you may want to check.")
+                log.info(
+                    "OpTestSystem Completed Gathering BMC logs, find them in the Log Location")
             # this will get esels for all
             log.info("OpTestSystem Starting to Gather ESEL's")
             try:
                 esel_entries = self.conf.op_system.sys_sel_elist()
-                esel_outfile = "{}/op-test-esel.{}".format(self.conf.logdir, marker_time)
+                esel_outfile = "{}/op-test-esel.{}".format(
+                    self.conf.logdir, marker_time)
                 self.dump_list(entries=esel_entries, outfile=esel_outfile)
-                log.info("OpTestSystem Completed Gathering ESEL's, find them in the Log Location")
+                log.info(
+                    "OpTestSystem Completed Gathering ESEL's, find them in the Log Location")
             except Exception as e:
-                log.debug("OpTestSystem encountered a problem trying to gather ESEL's, Exception={}".format(e))
+                log.debug(
+                    "OpTestSystem encountered a problem trying to gather ESEL's, Exception={}".format(e))
             self.dump_versions()
             self.dump_nvram_opts()
 
@@ -363,12 +515,13 @@ class OpTestUtil():
         '''
         if entries is None or outfile is None:
             raise ParameterCheck(message="Check your call to dump_list, entries"
-                                     " and outfile need valid values")
+                                 " and outfile need valid values")
         if type(entries) == str:
             list_obj = entries.splitlines()
         else:
             list_obj = entries
-        list_obj.insert(0, "From BMC {} Host {}".format(self.conf.args.bmc_ip, self.conf.args.host_ip))
+        list_obj.insert(0, "From BMC {} Host {}".format(
+            self.conf.args.bmc_ip, self.conf.args.host_ip))
         with open(outfile, 'w') as f:
             for line in list_obj:
                 f.write("{}\n".format(line))
@@ -1005,8 +1158,8 @@ class OpTestUtil():
     def PingMTUCheck(self, i_ip, i_try=1, totalSleepTime=BMC_CONST.HOST_BRINGUP_TIME):
         if i_ip == None:
             raise ParameterCheck(message="PingMTUCheck has i_ip set to 'None', "
-                "check your configuration and setup")
-        sleepTime = 0;
+                                 "check your configuration and setup")
+        sleepTime = 0
         while(i_try != 0):
             p1 = subprocess.Popen(["ping", "-M", "do", "-s 1400", "-c 5", str(i_ip)],
                                   stdin=subprocess.PIPE,
@@ -1017,7 +1170,8 @@ class OpTestUtil():
             stdout_value, stderr_value = p1.communicate()
 
             if(stdout_value.__contains__("5 received")):
-                log.debug("Ping successfully verified MTU discovery check (prohibit fragmentation), ping -M do -s 1400 -c 5 {}".format(i_ip))
+                log.debug(
+                    "Ping successfully verified MTU discovery check (prohibit fragmentation), ping -M do -s 1400 -c 5 {}".format(i_ip))
                 return BMC_CONST.PING_SUCCESS
 
             else:
@@ -1029,7 +1183,7 @@ class OpTestUtil():
                          .format(i_ip, sleepTime, totalSleepTime, i_try))
                 log.debug("%s is not able to successfully verify MTU discovery (Waited %d of %d, %d more "
                           "loop cycles remaining)" % (i_ip, sleepTime,
-                          totalSleepTime, i_try))
+                                                      totalSleepTime, i_try))
                 time.sleep(1)
                 sleepTime += 1
                 if (sleepTime == totalSleepTime):
@@ -1037,9 +1191,9 @@ class OpTestUtil():
                     sleepTime = 0
 
         log.warning("'{}' is not able to successfully verify MTU discovery (prohibit fragmentation) and we tried many times, "
-                  "check your configuration and setup.".format(i_ip))
+                    "check your configuration and setup.".format(i_ip))
         raise ParameterCheck(message="PingMTUCheck fails to verify MTU discovery (prohibit fragmentation) '{}', "
-            "check your configuration and setup manually ".format(i_ip))
+                             "check your configuration and setup manually ".format(i_ip))
 
     def copyFilesToDest(self, hostfile, destid, destName, destPath, passwd):
         arglist = (
@@ -1086,7 +1240,8 @@ class OpTestUtil():
         """
         Get PCI device type
         """
-        device_file = "cat /sys/class/pci_bus/{}/device/{}/uevent".format(pci_device[0:7], pci_device)
+        device_file = "cat /sys/class/pci_bus/{}/device/{}/uevent".format(
+            pci_device[0:7], pci_device)
         device_info = cv_HOST.host_run_command(device_file)
         var = {}
         for line in device_info:
@@ -1113,7 +1268,8 @@ class OpTestUtil():
         try:
             flush_interface = "ip addr flush {}".format(interface)
             cv_HOST.host_run_command(flush_interface)
-            ip_config = "ip addr add {}/{} dev {}".format(ip, netmask, interface)
+            ip_config = "ip addr add {}/{} dev {}".format(
+                ip, netmask, interface)
             cv_HOST.host_run_command(ip_config)
         except CommandFailed as cf:
             log.debug("configure ip to interface  CommandFailed={}".format(cf))
@@ -1318,19 +1474,20 @@ class OpTestUtil():
             return -1, -1
         my_user = host.username()
         my_pwd = host.password()
+        #time.sleep(0.1)
         pty.sendline()
-        rc = pty.expect(['login: ', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        rc = pty.expect([r".*[Ll]ogin[: ]+", pexpect.TIMEOUT, pexpect.EOF], timeout=30)
         if rc == 0:
             pty.sendline(my_user)
-            time.sleep(0.1)
+            #time.sleep(0.2)
             rc = pty.expect(
-                [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=60)
             if rc == 0:
                 pty.sendline(my_pwd)
-                time.sleep(0.5)
-                rc = pty.expect(['login: $', ".*#$", ".*# $", ".*\$", "~ #",
-                                 'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=60)
-                if rc not in [1, 2, 3, 4]:
+                time.sleep(1)
+                rc = pty.expect([r".*[Ll]ogin[: ]+", ".*#$", ".*# $", ".*\$", "~ #", ":~",
+                                 'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=100)
+                if rc not in [1, 2, 3, 4, 5]:
                     if term_obj.setup_term_quiet == 0:
                         log.warning("OpTestSystem Problem with the login and/or password prompt,"
                                     " raised Exception ConsoleSettings but continuing")
@@ -1353,18 +1510,18 @@ class OpTestUtil():
         else:  # timeout eof
             pty.sendline()
             rc = pty.expect(
-                ['login: ', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                ['login: ', pexpect.TIMEOUT, pexpect.EOF], timeout=60)
             if rc == 0:
                 pty.sendline(my_user)
                 time.sleep(0.1)
                 rc = pty.expect(
-                    [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                    [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=60)
                 if rc == 0:
                     pty.sendline(my_pwd)
                     time.sleep(0.5)
-                    rc = pty.expect(['login: $', ".*#$", ".*# $", ".*\$", "~ #",
-                                     'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-                    if rc not in [1, 2, 3, 4]:
+                    rc = pty.expect(['login: $', ".*#$", ".*# $", ".*\$", "~ #", ":~",
+                                     'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=60)
+                    if rc not in [1, 2, 3, 4, 5]:
                         if term_obj.setup_term_quiet == 0:
                             log.warning("OpTestSystem Problem with the login and/or password prompt,"
                                         " raised Exception ConsoleSettings but continuing")
@@ -1449,8 +1606,8 @@ class OpTestUtil():
         pty.sendline()
 
         if self.check_root(pty, prompt) is True:
-                # If we logged in as root or we're in the Petitboot shell we may
-                # already be root.
+            # If we logged in as root or we're in the Petitboot shell we may
+            # already be root.
             return 1, 1
 
         my_pwd = host.password()
@@ -1501,8 +1658,8 @@ class OpTestUtil():
         if system_obj.state == 3:  # OpSystemState.PETITBOOT
             return
 
-        rc = pty.expect(['login: $', ".*#$", ".*# $", ".*\$", "~>", "~ #",
-                         'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        rc = pty.expect(['r".*[Ll]ogin[: ]+', ".*#$", ".*# $", ".*\$", "~>", "~ #",
+                         'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=60)
         if rc == 0:
             track_obj.PS1_set, track_obj.LOGIN_set = self.get_login(
                 system_obj.cv_HOST, term_obj, pty, self.build_prompt(system_obj.prompt))
@@ -1532,14 +1689,14 @@ class OpTestUtil():
         # Ctrl-L may cause a esc[J (erase) character to appear in the buffer.
         # Include this in the patterns that expect $ (end of line)
         rc = pty.expect(['login: (\x1b\[J)*$', ".*#(\x1b\[J)*$", ".*# (\x1b\[J)*$", ".*\$(\x1b\[J)*",
-                         "~>(\x1b\[J)", "~ #(\x1b\[J)", 'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                         "~>(\x1b\[J)", "~ #(\x1b\[J)", ":~(\x1b\[J)*", 'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=30)
         if rc == 0:
             track_obj.PS1_set, track_obj.LOGIN_set = self.get_login(
                 system_obj.cv_HOST, term_obj, pty, self.build_prompt(system_obj.prompt))
             track_obj.PS1_set, track_obj.SUDO_set = self.get_sudo(
                 system_obj.cv_HOST, term_obj, pty, self.build_prompt(system_obj.prompt))
             return
-        if rc in [1, 2, 3, 4, 5]:
+        if rc in [1, 2, 3, 4, 5, 6]:
             track_obj.LOGIN_set = track_obj.PS1_set = self.set_PS1(
                 term_obj, pty, self.build_prompt(system_obj.prompt))
             track_obj.PS1_set, track_obj.SUDO_set = self.get_sudo(
@@ -1651,13 +1808,20 @@ class OpTestUtil():
                 raise CommandFailed(command, ''.join(failure_list_output), -1)
         return list_output, echo_rc
 
-    def run_command(self, term_obj, command, timeout=60, retry=0):
+    def run_command(self, term_obj, command, timeout=600, retry=5):
         # retry=0 will perform one pass
         counter = 0
         while counter <= retry:
             try:
                 output = self.try_command(term_obj, command, timeout)
-                return output
+                # Clean here — safe & stable
+                clean_output = []
+                for line in output:
+                    line = re.sub(r'\x1B\[[0-9;?]*[ -/]*[@-~]', '', line)
+                    line = line.replace('\r', '')
+                    clean_output.append(line)
+                
+                return clean_output
             except CommandFailed as cf:
                 log.debug("CommandFailed cf={}".format(cf))
                 if counter == retry:
@@ -1672,6 +1836,24 @@ class OpTestUtil():
                              " this will be retry \"{:02}\" of a total of \"{:02}\"\n \n".format(counter, retry))
 
     def try_command(self, term_obj, command, timeout=60):
+       # def clean_ansi(lines):
+       #     ansi = re.compile(r'\x1B\[[0-9;?]*[ -/]*[@-~]')
+       #     cleaned = []
+       #     for L in lines:
+       #         L = ansi.sub('', L)  # remove escape sequences
+       #         L = L.replace('\r', '')  # remove CR
+       #         cleaned.append(L)
+       #     return cleaned
+        
+        #ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+        #def clean_raw(raw):
+        #    if not raw:
+        #        return ""
+        #    raw = ANSI_RE.sub('', raw)
+        #    raw = raw.replace("\r", "")   # remove ^M
+        #    return raw
+        
         running_sudo_s = False
         extra_sudo_output = False
         expect_prompt = self.build_prompt(term_obj.prompt) + "$"
@@ -1688,6 +1870,11 @@ class OpTestUtil():
                              pexpect.TIMEOUT, pexpect.EOF], timeout=timeout)
         output_list = []
         output_list += pty.before.replace("\r\r\n", "\n").splitlines()
+       
+        # CLEAN before constructing output_list
+        #raw = clean_raw(pty.before)
+        #output_list = raw.splitlines()
+
         try:
             del output_list[:1]  # remove command from the list
         except Exception as e:
@@ -1696,6 +1883,7 @@ class OpTestUtil():
         if running_sudo_s and (rc == 0):
             extra_sudo_output = True
             set_env_list = self.set_env(term_obj, pty)
+            #set_env_list = clean_raw(set_env_list)
         if rc == 0:
             if extra_sudo_output:
                 output_list += set_env_list
@@ -1705,12 +1893,15 @@ class OpTestUtil():
             if rc2 == 0:
                 echo_output = []
                 echo_output += pty.before.replace("\r\r\n", "\n").splitlines()
+                #raw_echo = clean_raw(pty.before)
+                #echo_output = raw_echo.splitlines()
                 try:
                     del echo_output[:1]  # remove command from the list
+                    #echo_output = clean_raw(echo_output)
                 except Exception as e:
                     pass  # nothing there
                 try:
-                    echo_rc = int(echo_output[-1])
+                    echo_rc = int(echo_output[len(echo_output)-2])
                 except Exception as e:
                     echo_rc = -1
             else:
@@ -1722,14 +1913,18 @@ class OpTestUtil():
             # remove the expect prompt since matched generic #
             del handle_output_list[-1]
             output_list = handle_output_list
+            #output_list = clean_raw(handle_output_list)
         elif rc == 2:  # timeout
             # original raw buffer if it holds any clues
             output_list, echo_rc = self.try_sendcontrol(term_obj, command)
+            #output_list = clean_raw(output_list)
         else:
             term_obj.close()
             raise CommandFailed(command, "run_command TIMEOUT or EOF, the command timed out or something,"
                                 " probably a connection issue, retry", -1)
+        
         res = output_list
+
         if echo_rc != 0:
             raise CommandFailed(command, res, echo_rc)
         return res
@@ -1906,6 +2101,426 @@ class OpTestUtil():
         time.sleep(first)
         while time.monotonic() < end_time:
             if text:
+                log.debug("%s (%.9f secs)", text,
+                          (time.monotonic() - start_time))
+            output = func(*args, **kwargs)
+            if output:
+                return output
+            time.sleep(step)
+        return None
+
+    def clear_dmesg(self):
+        host = self.conf.host()
+        host.host_run_command("dmesg -C")
+
+    def collect_errors_by_level(self, output_dir=None, level_check=5, skip_errors=None, warn_errors=None):
+        """
+        Verify dmesg having severity level of OS issue(s).
+
+        :param output_dir: The directory used to save dmesg
+        :type output_dir: str
+        :param level_check: level of severity of issues to be checked
+                            1 - emerg
+                            2 - emerg,alert
+                            3 - emerg,alert,crit
+                            4 - emerg,alert,crit,err
+                            5 - emerg,alert,crit,err,warn
+        :type level_check: int
+        :skip_errors: list of dmesg error messages which want skip
+        :type skip_errors: list
+        :warn_errors: list of dmesg error messages which want skip, but must raise a warning
+        :type warn_errors: list
+        """
+        host = self.conf.host()
+        dmsg_log = out = ""
+        cmd = "dmesg -T -l %s|grep ." % ",".join(
+            map(str, range(0, int(level_check))))
+        try:
+            out = '\n'.join(host.host_run_command(cmd, timeout=30))
+        except CommandFailed as cmd_failed:
+            if cmd_failed.exitcode == 1 and len(cmd_failed.output) == 0:
+                pass
+            else:
+                raise cmd_failed
+        dmsg_log = self.skip_dmesg_messages(
+            out, skip_errors, warn_errors) if skip_errors else out
+        if dmsg_log:
+            if output_dir:
+                output_dir = os.path.join(host.results_dir, output_dir)
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                output_file = os.path.join(output_dir, "dmesgError")
+                with open(output_file, "w+", encoding='utf-8') as log_f:
+                    log_f.write(dmsg_log)
+                err = "Found failures in dmesg. Please check dmesg log %s." % (
+                    output_file)
+            else:
+                err = "Found failures in dmesg. Please check debug log."
+                log.debug(dmsg_log)
+            return err
+        return False
+
+    def skip_dmesg_messages(self, dmesg, skip_messages, warn_messages=[]):
+        """
+        Remove some messages from a dmesg buffer.
+
+        This method will remove some lines in a dmesg buffer if some strings are
+        present. Returning the same buffer, but with less lines (in case of match).
+
+        :dmesg: dmesg messages from which filter should be applied. This
+                must be a decoded output buffer with new lines.
+        :type dmesg: str
+        :skip_messages: list of strings to be removed
+        :type skip_messages: list
+        :warn_messages: list of strings to be removed, but must raise a warning
+        :type warn_messages: list
+        """
+        def filter_strings(line):
+            contains_warn_messages = any(
+                [string in line for string in warn_messages])
+            if contains_warn_messages:
+                log.warning(line)
+            return not any([string in line for string in skip_messages+warn_messages])
+
+        return '\n'.join(filter(None, filter(filter_strings, dmesg.splitlines())))
+
+    def gather_os_logs(self, list_of_files=[], list_of_commands=[], collect_sosreport=False, output_dir=None):
+        host = self.conf.host()
+        if not output_dir:
+            output_dir = "OS_Logs_%s" % (time.asctime(
+                time.localtime())).replace(" ", "_")
+        output_dir = os.path.join(host.results_dir, output_dir, "os")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        self.__gather_os_files_logs(list_of_files, output_dir)
+        self.__gather_os_command_logs(
+            list_of_commands, collect_sosreport, output_dir)
+
+    def __gather_os_files_logs(self, list_of_files=[], output_dir=None):
+        host = self.conf.host()
+        default_files = ['/var/log/messages', '/var/log/boot.log']
+        list_of_files.extend(default_files)
+
+        try:
+            host.host_run_command("mkdir -p files")
+            for file in set(list_of_files):
+                fn = "%s.log" % '-'.join(file.strip(os.path.sep).split(os.path.sep))
+                host.host_run_command("[ -f %s ] && { cp %s files/%s; } || "
+                                      "echo 'File does not exist'" % (file, file, fn))
+            host.copy_files_from_host(sourcepath=output_dir, destpath="files")
+            host.host_run_command("rm -rf files")
+            return True
+        except CommandFailed as cmd_failed:
+            raise cmd_failed
+
+    def __gather_os_command_logs(self, list_of_commands=[], collect_sosreport=False, output_dir=None):
+        host = self.conf.host()
+        default_commands = ['dmesg', 'journalctl -a']
+        list_of_commands.extend(default_commands)
+
+        try:
+            host.host_run_command("mkdir -p commands")
+            for cmd in set(list_of_commands):
+                fn = "%s.log" % '-'.join(
+                    (re.sub(r'[^a-zA-Z0-9]', ' ', cmd)).split())
+                host.host_run_command("%s > commands/%s" % (cmd, fn))
+            host.copy_files_from_host(
+                sourcepath=output_dir, destpath="commands")
+            host.host_run_command("rm -rf commands")
+
+            if collect_sosreport:
+                if 'rhel' in self.distro_name():
+                    host.host_run_command("yum install sos -y")
+                    cmd = 'yes "" | sosreport'
+                    str_msg = "Your sosreport has been generated and saved in:"
+                elif 'sles' in self.distro_name():
+                    host.host_run_command("zypper install -y supportutils")
+                    cmd = 'supportconfig'
+                    str_msg = "  Log file tar ball:"
+                output = host.host_run_command(cmd)
+                path = output[output.index(str_msg)+1].strip()
+                host.copy_files_from_host(sourcepath=output_dir, destpath=path)
+            return True
+        except CommandFailed as cmd_failed:
+            raise cmd_failed
+
+    def gather_vios_logs(self, vios_name, vios_ip, vios_username, vios_password, list_of_commands=[], output_dir=None):
+        vios = OpTestVIOS(vios_name, vios_ip, vios_username,
+                          vios_password, conf=self.conf)
+        vios.set_system(self.conf.system())
+        vios.gather_logs(list_of_commands, output_dir)
+
+    def gather_hmc_logs(self, list_of_commands=[], remote_hmc=None, output_dir=None):
+        hmc = self.conf.hmc()
+        hmc.gather_logs(list_of_commands, remote_hmc, output_dir)
+
+    def gather_os_vios_hmc_logs(self, vios_name, vios_ip, vios_username, vios_password, list_of_vios_commands=[],
+                                list_of_os_files=[], list_of_os_commands=[], collect_sosreport=False,
+                                list_of_hmc_commands=[], remote_hmc=None, output_dir=None):
+        self.gather_os_logs(
+            list_of_os_files, list_of_os_commands, collect_sosreport, output_dir)
+        self.gather_vios_logs(vios_name, vios_ip, vios_username,
+                              vios_password, list_of_vios_commands, output_dir)
+        self.gather_hmc_logs(list_of_hmc_commands, remote_hmc, output_dir)
+
+    def distro_name(self):
+        host = self.conf.host()
+        res = host.host_run_command("cat /etc/os-release")
+        if "Ubuntu" in res[0] or "Ubuntu" in res[1]:
+            return "ubuntu"
+        elif 'Red Hat' in res[0] or 'Red Hat' in res[1]:
+            return "rhel"
+        elif 'SLES' in res[0] or 'SLES' in res[1]:
+            return "sles"
+        else:
+            return "unknown"
+
+    def get_distro_details(self):
+        '''
+        1. Reads the contents of /etc/os-release
+        2. Formulates the same into a dictionary format.
+        3. Returns this dictionary in the format as below:
+        {
+            'NAME': ['"Red Hat Enterprise Linux"'], 
+            'VERSION': ['"8.8 (Ootpa)"'], 
+            'ID': ['"rhel"']
+            . . . .
+            . . . .
+        }
+
+        :param None
+        :return distro_details: contents in dictionary format
+        '''
+        temporary_list = []
+        distro_details = {}
+        host = self.conf.host()
+        res = host.host_run_command("cat /etc/os-release")
+
+        loop_count = 0
+        while loop_count < len(res):
+            temporary_list.append(res[loop_count].split("="))
+            loop_count = loop_count+1
+        
+        distro_details =  {loop_count[0] : loop_count[1:] for loop_count in temporary_list}
+        return distro_details
+    
+    def get_distro_version(self):
+        '''
+        Returns the distro version value from the dictionary, fetched
+        by calling get_distro_details()
+
+        :param None
+        :return distro_version
+        '''
+        res = self.get_distro_details()
+        return res.get('VERSION_ID')[0].strip("\"") 
+
+    def get_distro_src(self, package, dest_path, build_option=None, pack_dir=None):
+        
+        '''
+        Downloads the source package and prepares it in the given dest_path
+        to be ready to build.
+
+        :param package: name of the package
+        :param dest_path: destination_path
+        :param build_option : rpmbuild option
+        :param pack_dir: final pakage dir in case of sles
+        :return path: build directory
+        '''
+        if dest_path is None:
+            log.error("Please provide a valid path")
+            return ""
+        host = self.conf.host()
+        if self.distro_name() == 'rhel':
+            path = tempfile.mkdtemp(prefix="optest_src")
+            for pkg in ["rpm-build", "yum-utils"]:
+                host.host_run_command("yum install %s -y" %pkg)
+            host.host_run_command(f"yumdownloader --assumeyes --verbose --source {package} --destdir {path}")
+            src_rpms = host.host_run_command(f"basename {path}/*")
+            if len(src_rpms) != 1:
+                log.error("Failed to get downloaded src.rpm")
+                return ""
+
+            cmd = f"rpm -i --nodeps {os.path.join(path, src_rpms[-1])}"
+            if host.host_run_command(cmd):
+                spec_path = host.host_run_command(f"echo `echo $HOME`/rpmbuild/SPECS/{package}.spec")
+                if host.host_run_command(f"yum-builddep -y {spec_path[0]}"):
+                    return self.prepare_source(spec_path[0], host, dest_path, package, build_option)
+                else:
+                    log.error("Installing build dependencies failed")
+                    return ""
+            else:
+                log.error("Installing source rpm failed")
+                return ""
+            log.error(details)
+            return ""
+
+        elif self.distro_name() == 'sles':
+            host.host_run_command("zypper install -y  rpm-build")
+            if package.startswith("kernel"):
+                s_cmd = f"zypper -n source-install kernel-source;cd /usr/src/packages/SOURCES/;./mkspec;cp  {package}.spec ../SPECS/"
+            else:
+                s_cmd = f"zypper -n source-install {package};cd /usr/src/packages/SOURCES/;./mkspec;cp  {package}.spec ../SPECS/"
+            if host.host_run_command(s_cmd):
+
+                spec_path = f"/usr/src/packages/SPECS/{package}.spec"
+            else:
+               spec_path = None
+            if spec_path:
+                return self.prepare_source(spec_path,host, dest_path, package, build_option, 'sles', pack_dir)
+            else:
+                log.error("Failed to install distro package")
+        else:
+            return ""
+
+
+    def prepare_source(self,spec_file, host, dest_path, package, build_option=None, distro=None, pack_dir=None):
+        """
+        Rpmbuild the spec path and return build dir
+
+        :param spec_path: spec path to install
+        :param host: host object
+        :param dest_path: where to wnrap src rpm
+        :param package: src rpm name
+        :param  build_option : rpmbuild option
+        :return path: build directory
+        """
+        if build_option is None:
+            build_option = "-bp"
+        build_option += f" --define '_builddir {dest_path}'"
+        try:
+            host.host_run_command(f"rpmbuild {build_option} {spec_file}")
+            dir_name = host.host_run_command(f"ls -d -- {dest_path}/* | grep {package}")[0]
+            if distro is not None:
+                dir_name = host.host_run_command(f"ls -d -- {dir_name}/* | grep linux")[0]
+            return dir_name
+        except OpTestError:
+            return ""
+
+    def err_message(self, er):
+        """
+        To get entire error msg
+        """
+        error_message = [str(item) for item in er]
+        combined_error = '\n'.join(error_message)
+        combined_error = re.sub(r'\x1b\[[0-9;]*[mK]|,', '', combined_error)
+        parts = combined_error.split('\x1b[')
+        cleaned_error = ''.join(char for char in combined_error if ord(char) < 128)
+        pattern = r'in file.*?compilation terminated'
+        match = re.search(pattern, cleaned_error, re.IGNORECASE | re.DOTALL)
+        if match:
+            relevant_part = match.group(0)
+            return relevant_part
+        return " "
+
+    def get_email(self, commit_id):
+        """
+        To get email of Author from the identified bad commit
+        """
+        connection = self.conf.host()
+        try :
+            connection.host_run_command("git config --global color.ui true")
+            result = connection.host_run_command("git show --format=%ce {} | sed -r 's/\x1B\[[0-9:]*[JKsu]//g'".format(commit_id))
+            return result[0]
+        except subprocess.CalledProcessError as e:
+            log.info(e)
+            return None
+
+    def build_bisector(self, linux_path, good_commit, repo):
+        connection = self.conf.host()
+        connection.host_run_command(" if [ '$(pwd)' != {} ]; then cd {} || exit 1 ; fi ".format(linux_path,linux_path))
+        shallow = connection.host_run_command("git rev-parse --is-shallow-repository")
+        if shallow[-1] in [True,'true']:
+            connection.host_run_command("git fetch --unshallow",timeout=3000)
+        makefile_path = os.path.join(self.conf.basedir, "test_binaries/make.sh")
+        connection.copy_test_file_to_host(makefile_path, dstdir=linux_path)
+        connection.host_run_command("git bisect start")
+        folder_type=re.split(r'[\/\\.]',str(repo))[-2]
+        if folder_type == 'linux-next':
+            connection.host_run_command("git fetch --tags")
+            good_tag=connection.host_run_command("git tag -l 'v[0-9]*' | sort -V | tail -n 1")
+            connection.host_run_command("git bisect good {} ".format(good_tag[0]))
+        else:
+            connection.host_run_command("git bisect good {} ".format(good_commit))
+        connection.host_run_command(" git bisect bad ")
+        connection.host_run_command("chmod +x ./make.sh ")
+        commit =  connection.host_run_command(" git bisect run ./make.sh")
+        badCommit = [word for word in commit if word.endswith("is the first bad commit")]
+        badCommit= badCommit[0].split()[0]
+        email = self.get_email(badCommit)
+        connection.host_run_command("git bisect log")
+        connection.host_run_command("git bisect reset")
+        return email, badCommit
+
+    def get_commit_message(self, linux_path, commit_sha):
+        connection = self.conf.host()
+        try:
+            connection.host_run_command(" if [ '$(pwd)' != {} ]; then cd {} || exit 1 ; fi ".format(linux_path,linux_path))
+            commit_message = connection.host_run_command("git log -n 1 --pretty=format:%s {} | sed -r 's/\x1B\[[0-9:]*[JKsu]//g'".format(commit_sha))
+        except subprocess.CalledProcessError as e:
+            log.info(e)
+            commit_message = None
+        return commit_message[0].strip()
+
+    def format_email(self, linux_path , repo):
+        connection = self.conf.host()
+        machine_type = connection.host_run_command("uname -m")
+        gcc_version = connection.host_run_command("gcc --version")[0]
+        kernel_version = connection.host_run_command("uname -r")
+        try:
+            with open("output.json", "r") as file:
+                data = json.load(file)
+                error_message = data.get("error", "")
+                err_long = data.get("err_msg","")
+                commit = str(data.get("commit", ""))[:7]
+        except FileNotFoundError:
+            log.error("Error: output.json not found.")
+            error_message = ""
+            commit = ""
+        fix_description = self.get_commit_message(linux_path,commit)
+        if "netdev/net" in repo:
+            linux = "netdev/net"
+        elif "netdev/net-next" in repo:
+            linux = "netdev/net-next"
+        elif "mkp/scsi" in repo :
+            linux = "scsi/scsi-queue"
+        elif "torvalds/linux" in repo:
+            linux = "mainline/master"
+        elif "next/linux-next" in repo:
+            linux = "linux-next/master"
+        else:
+            linux = "linux"
+        subject = "[{}][bisected {}] [{}] build fail with error: {}".format(linux,commit, machine_type, error_message)
+        body = """
+        Greetings,
+
+        Today's {} kernel fails to build on {} machine.
+
+        Kernel build fail at error: {}
+        {}
+
+        Kernel Version: {}
+        Machine Type: {}
+        gcc: {}
+        Bisected Commit: {}
+
+        kernel builds fine when the bad commit ({})  is reverted
+        {} - {}
+        --
+        Regards
+        Linux CI
+        """.format(linux, machine_type, error_message,err_long,kernel_version, machine_type, gcc_version, commit,commit, commit, fix_description)
+        with open("email.json","w") as email:
+             json.dump({"subject":subject,"body":body},email)
+
+    def wait_for(self, func, timeout, first=0.0, step=1.0, text=None, args=None, kwargs=None):
+        args = args or []
+        kwargs = kwargs or {}
+        start_time = time.monotonic()
+        end_time = start_time + timeout
+        time.sleep(first)
+        while time.monotonic() < end_time:
+            if text:
                 log.debug("%s (%.9f secs)", text, (time.monotonic() - start_time))
             output = func(*args, **kwargs)
             if output:
@@ -2000,6 +2615,12 @@ class Server(object):
                 self.xAuthHeader['X-Auth-Token'] = match.group(1)
                 self.jsonHeader.update(self.xAuthHeader)
             json_data = json.loads(r.text)
+            if json_data.get('token'):
+                json_data={
+                          "data": "User '%s' logged in" %username,
+                            "message": "200 OK",
+                              "status": "ok"
+                              }
             log.debug("r.status_code={} json_data['status']={}"
                       " r.text={} r.headers={} r.request.headers={}"
                       .format(r.status_code, json_data['status'],
