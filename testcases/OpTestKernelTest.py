@@ -166,7 +166,10 @@ class KernelTest(unittest.TestCase):
         Does kexec boot for Upstream Linux
         """
         self.con.run_command("export TERM=dumb; export NO_COLOR=1; alias ls='ls --color=never'; alias grep='grep --color=never'; git config --global color.ui false; bind 'set enable-bracketed-paste off'")
+        #self.con.run_command("cd {}".format(self.linux_path))
+        #self.ker_ver = self.con.run_command("make kernelrelease")[-1]
         base_version = self.con.run_command("uname -r")
+
         if self.host_distro_name in ['rhel', 'Red Hat', 'ubuntu', 'Ubuntu']:
             self.con.run_command('grubby --set-default /boot/vmlinu*-{}'.format(base_version[-1]))
         elif self.host_distro_name in ['sles', 'SLES']:
@@ -184,28 +187,24 @@ class KernelTest(unittest.TestCase):
             kexec_cmdline = "kexec -l --initrd %s  /boot/vmlinuz-%s  --reuse-cmdline --kexec-file" % (initrd_file, self.ker_ver)
         else:
             kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinu*-%s -l" % (initrd_file, cmdline, self.ker_ver)
+
+        #if self.host_distro_name in ['rhel', 'Red Hat', 'ubuntu', 'Ubuntu']:
+        #    self.con.run_command('grubby --set-default /boot/vmlinuz-{}'.ker_ver)
+        #elif self.host_distro_name in ['sles', 'SLES']:
+        #    self.con.run_command('grub2-set-default /boot/vmlinu*-{}'.format(base_version[-1]))
+        #else:
+        #    raise self.skipTest("Unsupported OS")
+
         self.con.run_command("grub2-mkconfig  --output=/boot/grub2/grub.cfg", timeout=30)
         self.con.run_command(kexec_cmdline)
         self.con.run_command("bind 'set enable-bracketed-paste off'")
         
         self.con.close()
         
-        #self.console_thread.console_terminate()
-        #self.cv_SYSTEM.util.build_prompt()
-        #self.console_thread.console_terminate()
+        self.console_thread.console_terminate()
+        self.cv_SYSTEM.util.build_prompt()
+        self.console_thread.console_terminate()
         
-        raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
-        
-        time.sleep(30)
-        log.info("time sleep")
-        #for i in range(5):
-        #    raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
-        #    time.sleep(10)
-        #    if raw_pty:
-        #        log.info("checking kernel version")
-        #        raw_pty.sendline("uname -r")
-        #        break
-      
         raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
         
         try:
@@ -214,18 +213,17 @@ class KernelTest(unittest.TestCase):
             #sleep(8000)
         except Exception as e:
             log.info(e)
-      
-        rc = raw_pty.expect([r"(?i)(^|.*\s)login:\s*$", "WARNING: CPU", r"Kernel panic"], timeout=900)
+    
+        rc = raw_pty.expect(["login:", "WARNING: CPU"], timeout=600)
 
         if rc == 1:
             dmessage = []
-            #raw_pty.close()
-            #self.cv_SYSTEM.console.close()
             log.info("Kernel Boot WARNING: Found!")
             #in case of kernel crash or oops or hung we might need system OFF ON or wait for base login
             #this delay is must to make sure the lpar has booted to login and ssh service is up
             while True:
                 status = subprocess.run(["ping", "-c", "3", self.conf.args.host_ip], capture_output=True)
+                log.info("rc == 1 ....")
                 if status.returncode != 0:
                     log.info("booting...")
                 time.sleep(10)
