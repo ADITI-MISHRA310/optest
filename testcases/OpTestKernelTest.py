@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import PexpectLogger 
 
 from common.OpTestSystem import OpSystemState
 from common.OpTestSOL import OpSOLMonitorThread
@@ -128,9 +129,12 @@ class KernelTest(unittest.TestCase):
         """
         Install necesary packages if custom kernel, Build and install the Linux kernel.
         """
-        self.con.run_command("cd {} &&  cp /boot/config-$(uname -r) .config && make olddefconfig".format(self.linux_path), timeout=60)
-        # the below part of the code is needed for only first run and will be decided bisect flag false
-        
+        if(self.kernel_local):
+            self.con.run_command("cd {} &&  cp /boot/config-$(uname -r) .config && make olddefconfig".format(self.linux_path), timeout=60)
+            # the below part of the code is needed for only first run and will be decided bisect flag false
+        else:
+            self.con.run_command("cd {} && make olddefconfig".format(self.linux_path), timeout=60)
+
         self.ker_ver = self.con.run_command("make kernelrelease")[-1]
         if not self.kernel_local:
             #self.ker_ver = self.con.run_command("make kernelrelease")[-1]
@@ -166,58 +170,81 @@ class KernelTest(unittest.TestCase):
         Does kexec boot for Upstream Linux
         """
         self.con.run_command("export TERM=dumb; export NO_COLOR=1; alias ls='ls --color=never'; alias grep='grep --color=never'; git config --global color.ui false; bind 'set enable-bracketed-paste off'")
-        #self.con.run_command("cd {}".format(self.linux_path))
-        #self.ker_ver = self.con.run_command("make kernelrelease")[-1]
         base_version = self.con.run_command("uname -r")
 
-        if self.host_distro_name in ['rhel', 'Red Hat', 'ubuntu', 'Ubuntu']:
+        if self.host_distro_name in ['rhel','Fedora', 'Red Hat', 'ubuntu', 'Ubuntu']:
             self.con.run_command('grubby --set-default /boot/vmlinu*-{}'.format(base_version[-1]))
         elif self.host_distro_name in ['sles', 'SLES']:
             self.con.run_command('grub2-set-default /boot/vmlinu*-{}'.format(base_version[-1]))
         else:
             raise self.skipTest("Unsupported OS")
+    
         cmdline = self.con.run_command("cat /proc/cmdline")[-1]
+        cmdline_updated = ""
+
         if self.append_kernel_cmdline:
             cmdline += " %s" % self.append_kernel_cmdline
+            log.info("original cmdline: %s", cmdline)
+        elif self.kernel_local:
+            log.info("setting kexec_cmdline")
+            cmdline_updated = re.sub(r'\bBOOT_IMAGE=[^\s]+\s*', '', cmdline).strip()
+            log.info(f"Updated cmdline: %s", cmdline_updated)
+
         try:
             initrd_file = self.con.run_command("ls -l /boot/initr*-%s.img" % self.ker_ver)[-1].split(" ")[-1]
         except Exception:
             initrd_file = self.con.run_command("ls -l /boot/initr*-%s" % self.ker_ver)[-1].split(" ")[-1]
+        
         if(self.kernel_local):
-            kexec_cmdline = "kexec -l --initrd %s  /boot/vmlinuz-%s  --reuse-cmdline --kexec-file" % (initrd_file, self.ker_ver)
+            kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinuz-%s -l" % (initrd_file,cmdline_updated, self.ker_ver)
         else:
             kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinu*-%s -l" % (initrd_file, cmdline, self.ker_ver)
-
-        #if self.host_distro_name in ['rhel', 'Red Hat', 'ubuntu', 'Ubuntu']:
-        #    self.con.run_command('grubby --set-default /boot/vmlinuz-{}'.ker_ver)
-        #elif self.host_distro_name in ['sles', 'SLES']:
-        #    self.con.run_command('grub2-set-default /boot/vmlinu*-{}'.format(base_version[-1]))
-        #else:
-        #    raise self.skipTest("Unsupported OS")
-
-        self.con.run_command("grub2-mkconfig  --output=/boot/grub2/grub.cfg", timeout=30)
+        log.info("kexec_cmdline is happening ...")
         self.con.run_command(kexec_cmdline)
         self.con.run_command("bind 'set enable-bracketed-paste off'")
         
         self.con.close()
-        
-        self.console_thread.console_terminate()
         self.cv_SYSTEM.util.build_prompt()
         self.console_thread.console_terminate()
-        
+       
         raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
-        
+       
         try:
             log.info("Doing kexec -e")
             raw_pty.sendline("kexec -e")
-            #sleep(8000)
         except Exception as e:
             log.info(e)
+   
+        # Get fresh console connection - CRITICAL before kexec -e
+        log.info("Acquiring fresh console connection for kexec execution...")
+        raw_pty = self.util.wait_for(
+            self.cv_SYSTEM.console.get_console, 
+            timeout=80
+            )
     
-        rc = raw_pty.expect(["login:", "WARNING: CPU"], timeout=600)
+        if not raw_pty:
+            raise Exception("Failed to acquire fresh console connection")
+    
+        # Small delay to ensure console is stable
+        time.sleep(2)
+    
+        # Execute kexec -e
+        log.info("Executing kexec -e...")
+        try:
+            raw_pty.sendline("kexec -e")
+            log.debug("kexec -e command sent")
+        except Exception as e:
+            log.warning(f"Exception sending kexec -e (may be expected): {e}")
+    
+        # Wait for boot to complete
+        log.info("Waiting for system to boot (timeout: 600s)...")
+        
+        rc = raw_pty.expect(r".*[Ll]ogin[: ]+", "WARNING: CPU", pexect.EOF, timeout=600)
 
         if rc == 1:
             dmessage = []
+            raw_pty.close()
+            self.cv_SYSTEM.console.close()
             log.info("Kernel Boot WARNING: Found!")
             #in case of kernel crash or oops or hung we might need system OFF ON or wait for base login
             #this delay is must to make sure the lpar has booted to login and ssh service is up
@@ -243,9 +270,6 @@ class KernelTest(unittest.TestCase):
             if kernel_version_output[-1] == base_version[-1]:
                 log.error("Kexec failed, booted back to base kernel !")
             return True
-        else:
-            log.info("Booting failed .. with rc not 0 or 1")
-            return False
 
 
     def runTest(self):
@@ -282,6 +306,7 @@ class KernelTest(unittest.TestCase):
                 boot = self.boot_kernel()
             except Exception as e:
                 log.info("EXCEPTION")
+                sys.exit(1)
             if not boot and self.bisect_flag == '1':
                 count = 0
                 exit_code = 4
@@ -358,7 +383,7 @@ class KernelTest(unittest.TestCase):
                 self.con.run_command("cd {}".format(self.home))
                 self.con.run_command("uname -r", timeout=60)
                 log.info("\n ------Cloning stressng workload ------ \n")
-                subprocess.run("git clone https://github.com/ColinIanKing/stress-ng.git", timeout=600)
+                self.con.run_command("git clone https://github.com/ColinIanKing/stress-ng.git", timeout=600)
                 output = subprocess.check_output("stress-ng --cpu 8 --timeout 60", timeout=600)
                 print(output)
             else:

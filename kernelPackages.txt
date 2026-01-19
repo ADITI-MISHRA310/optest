@@ -20,3 +20,4 @@ rsync
 git 
 tar 
 xz
+openssl

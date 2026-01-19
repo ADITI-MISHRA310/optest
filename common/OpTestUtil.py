@@ -1476,16 +1476,14 @@ class OpTestUtil():
         my_pwd = host.password()
         #time.sleep(0.1)
         pty.sendline()
-        rc = pty.expect([r".*[Ll]ogin[: ]+", pexpect.TIMEOUT, pexpect.EOF], timeout=30)
+        rc = pty.expect([r".*[Ll]ogin[: ]+", r"Last login", r".*#\s*$", r".*\$\s*$", pexpect.TIMEOUT, pexpect.EOF], timeout=180)
         if rc == 0:
             pty.sendline(my_user)
-            #time.sleep(0.2)
             rc = pty.expect(
                 [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=60)
             if rc == 0:
                 pty.sendline(my_pwd)
-                time.sleep(1)
-                rc = pty.expect([r".*[Ll]ogin[: ]+", ".*#$", ".*# $", ".*\$", "~ #", ":~",
+                rc = pty.expect([r".*[Ll]ogin[: ]+", r"Last login", ".*#$", ".*# $", ".*\$", "~ #", ":~",
                                  'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=100)
                 if rc not in [1, 2, 3, 4, 5]:
                     if term_obj.setup_term_quiet == 0:
