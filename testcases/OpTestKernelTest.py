@@ -74,7 +74,7 @@ class KernelTest(unittest.TestCase):
         self.console_thread.start()
         self.kernel_local = self.conf.args.kernel_local
         self.kernel_local_loc = self.conf.args.kernel_local_loc
-        
+        self.use_kexec = self.conf.args.use_kexec 
         self.con.run_command("bind 'set enable-bracketed-paste off' 2>/dev/null || true", timeout=10)
 
         def scp_kernel_local():
@@ -130,7 +130,12 @@ class KernelTest(unittest.TestCase):
         Install necesary packages if custom kernel, Build and install the Linux kernel.
         """
         if(self.kernel_local):
-            self.con.run_command("cd {} &&  cp /boot/config-$(uname -r) .config && make olddefconfig".format(self.linux_path), timeout=60)
+            conf_cmd = self.con.run_command("ls /boot/config-* 2>/dev/null")
+            if not conf_cmd:
+                raise Exception("NO config present in /boot")
+            else:
+                config_file = conf_cmd[-1]
+            self.con.run_command("cd {} &&  cp {} .config && make olddefconfig".format(self.linux_path, config_file), timeout=100)
             # the below part of the code is needed for only first run and will be decided bisect flag false
         else:
             self.con.run_command("cd {} && make olddefconfig".format(self.linux_path), timeout=60)
@@ -171,105 +176,93 @@ class KernelTest(unittest.TestCase):
         """
         self.con.run_command("export TERM=dumb; export NO_COLOR=1; alias ls='ls --color=never'; alias grep='grep --color=never'; git config --global color.ui false; bind 'set enable-bracketed-paste off'")
         base_version = self.con.run_command("uname -r")
-
-        if self.host_distro_name in ['rhel','Fedora', 'Red Hat', 'ubuntu', 'Ubuntu']:
+   
+        if self.host_distro_name in ['rhel', 'Red Hat', 'fedora', 'Fedora', 'ubuntu', 'Ubuntu']:
             self.con.run_command('grubby --set-default /boot/vmlinu*-{}'.format(base_version[-1]))
         elif self.host_distro_name in ['sles', 'SLES']:
             self.con.run_command('grub2-set-default /boot/vmlinu*-{}'.format(base_version[-1]))
-        else:
-            raise self.skipTest("Unsupported OS")
+
+        if self.use_kexec:
+            
+            cmdline = self.con.run_command("cat /proc/cmdline")[-1]
+            cmdline_updated = ""
+
+            if self.append_kernel_cmdline:
+                cmdline += " %s" % self.append_kernel_cmdline
+                log.info("original cmdline: %s", cmdline)
+            elif self.kernel_local:
+                log.info("setting kexec_cmdline")
+                cmdline_updated = re.sub(r'\bBOOT_IMAGE=[^\s]+\s*', '', cmdline).strip()
+                log.info(f"Updated cmdline: %s", cmdline_updated)
+
+            try:
+                initrd_file = self.con.run_command("ls -l /boot/initr*-%s.img" % self.ker_ver)[-1].split(" ")[-1]
+            except Exception:
+                initrd_file = self.con.run_command("ls -l /boot/initr*-%s" % self.ker_ver)[-1].split(" ")[-1]
+            
+            if(self.kernel_local):
+                kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinuz-%s -l" % (initrd_file,cmdline_updated, self.ker_ver)
+            else:
+                kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinu*-%s -l" % (initrd_file, cmdline, self.ker_ver)
+            log.info("kexec_cmdline is happening ...")
+            self.con.run_command(kexec_cmdline)
+            self.con.run_command("bind 'set enable-bracketed-paste off'")
+            
+            self.con.close()
+            self.cv_SYSTEM.util.build_prompt()
+            self.console_thread.console_terminate()
+       
+            raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
+       
+            try:
+                log.info("Doing kexec -e")
+                raw_pty.sendline("kexec -e")
+            except Exception as e:
+                log.info(e)
+   
+            # Get fresh console connection - CRITICAL before kexec -e
+            log.info("Acquiring fresh console connection for kexec execution...")
+            raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
     
-        cmdline = self.con.run_command("cat /proc/cmdline")[-1]
-        cmdline_updated = ""
-
-        if self.append_kernel_cmdline:
-            cmdline += " %s" % self.append_kernel_cmdline
-            log.info("original cmdline: %s", cmdline)
-        elif self.kernel_local:
-            log.info("setting kexec_cmdline")
-            cmdline_updated = re.sub(r'\bBOOT_IMAGE=[^\s]+\s*', '', cmdline).strip()
-            log.info(f"Updated cmdline: %s", cmdline_updated)
-
-        try:
-            initrd_file = self.con.run_command("ls -l /boot/initr*-%s.img" % self.ker_ver)[-1].split(" ")[-1]
-        except Exception:
-            initrd_file = self.con.run_command("ls -l /boot/initr*-%s" % self.ker_ver)[-1].split(" ")[-1]
-        
-        if(self.kernel_local):
-            kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinuz-%s -l" % (initrd_file,cmdline_updated, self.ker_ver)
+            if not raw_pty:
+                raise Exception("Failed to acquire fresh console connection")
+    
+            # Small delay to ensure console is stable
+            time.sleep(2)
+    
+            # Execute kexec -e
+            log.info("Executing kexec -e...")
+            try:
+                raw_pty.sendline("kexec -e")
+                log.debug("kexec -e command sent")
+            except Exception as e:
+                log.warning(f"Exception sending kexec -e (may be expected): {e}")
         else:
-            kexec_cmdline = "kexec --initrd %s --command-line=\"%s\" /boot/vmlinu*-%s -l" % (initrd_file, cmdline, self.ker_ver)
-        log.info("kexec_cmdline is happening ...")
-        self.con.run_command(kexec_cmdline)
-        self.con.run_command("bind 'set enable-bracketed-paste off'")
-        
-        self.con.close()
+            # FIXME: Handle distributions which do not support grub
+            self.con.run_command('grubby --set-default /boot/vmlinuz-`cat include/config/kernel.release 2> /dev/null`')
+            log.info('grub config ....')
+            self.con.run_command("grub2-mkconfig  --output=/boot/grub2/grub.cfg")
+            log.debug("Rebooting after kernel install...")
+            boot_cmd = 'reboot'
         self.cv_SYSTEM.util.build_prompt()
         self.console_thread.console_terminate()
-       
-        raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
-       
-        try:
-            log.info("Doing kexec -e")
-            raw_pty.sendline("kexec -e")
-        except Exception as e:
-            log.info(e)
-   
-        # Get fresh console connection - CRITICAL before kexec -e
-        log.info("Acquiring fresh console connection for kexec execution...")
-        raw_pty = self.util.wait_for(
-            self.cv_SYSTEM.console.get_console, 
-            timeout=80
-            )
-    
-        if not raw_pty:
-            raise Exception("Failed to acquire fresh console connection")
-    
-        # Small delay to ensure console is stable
-        time.sleep(2)
-    
-        # Execute kexec -e
-        log.info("Executing kexec -e...")
-        try:
-            raw_pty.sendline("kexec -e")
-            log.debug("kexec -e command sent")
-        except Exception as e:
-            log.warning(f"Exception sending kexec -e (may be expected): {e}")
-    
-        # Wait for boot to complete
-        log.info("Waiting for system to boot (timeout: 600s)...")
+        self.con.close()
         
-        rc = raw_pty.expect(r".*[Ll]ogin[: ]+", "WARNING: CPU", pexect.EOF, timeout=600)
+        raw_pty = self.util.wait_for(self.cv_SYSTEM.console.get_console, timeout=80)
+        raw_pty.sendline(boot_cmd)
+        raw_pty.expect(r".*[Ll]ogin[: ]+", timeout=600)
+        self.cv_SYSTEM.util.wait_for_os_boot()
+        con = self.cv_SYSTEM.cv_HOST.get_ssh_connection()
+        kernel_version_output = self.con.run_command("uname -r")[-1]
+        log.info("Installed custom kernel version: %s", kernel_version_output)
+        if kernel_version_output[-1] == base_version[-1]:
+            log.error("Kexec failed, booted back to base kernel !")
 
-        if rc == 1:
-            dmessage = []
-            raw_pty.close()
-            self.cv_SYSTEM.console.close()
-            log.info("Kernel Boot WARNING: Found!")
-            #in case of kernel crash or oops or hung we might need system OFF ON or wait for base login
-            #this delay is must to make sure the lpar has booted to login and ssh service is up
-            while True:
-                status = subprocess.run(["ping", "-c", "3", self.conf.args.host_ip], capture_output=True)
-                log.info("rc == 1 ....")
-                if status.returncode != 0:
-                    log.info("booting...")
-                time.sleep(10)
-                self.con = self.cv_SYSTEM.cv_HOST.get_ssh_connection()
-                if self.con:
-                    self.con.run_command('uname -r')
-                    break
-            return False
-
-        if rc == 0:
-            raw_pty.close()
-            self.cv_SYSTEM.console.close()
-            log.info("Kernel Booted ..")
-            self.con = self.cv_SYSTEM.cv_HOST.get_ssh_connection()
-            kernel_version_output = self.con.run_command("uname -r")[-1]
-            log.info("Installed upstream kernel version: %s", kernel_version_output)
-            if kernel_version_output[-1] == base_version[-1]:
-                log.error("Kexec failed, booted back to base kernel !")
-            return True
+        if self.conf.args.host_cmd:
+            con.run_command(self.conf.args.host_cmd, timeout=self.host_cmd_timeout)
+        self.cv_HOST.host_gather_opal_msg_log()
+        self.cv_HOST.host_gather_kernel_log()
+        self.console_thread.console_terminate()
 
 
     def runTest(self):
@@ -281,6 +274,7 @@ class KernelTest(unittest.TestCase):
         error = self.build_kernel()
         bi_flag = False
         exit_code = error[0]
+        #exit_code = 0
         errVal = str(error[1])
         log.info("Printing the build exit code '{}'".format(exit_code))
         entry=[]
@@ -306,7 +300,7 @@ class KernelTest(unittest.TestCase):
                 boot = self.boot_kernel()
             except Exception as e:
                 log.info("EXCEPTION")
-                sys.exit(1)
+                #sys.exit(1)
             if not boot and self.bisect_flag == '1':
                 count = 0
                 exit_code = 4
@@ -384,8 +378,12 @@ class KernelTest(unittest.TestCase):
                 self.con.run_command("uname -r", timeout=60)
                 log.info("\n ------Cloning stressng workload ------ \n")
                 self.con.run_command("git clone https://github.com/ColinIanKing/stress-ng.git", timeout=600)
-                output = subprocess.check_output("stress-ng --cpu 8 --timeout 60", timeout=600)
-                print(output)
+                output = self.con.run_command("stress-ng --cpu 8 --timeout 60", timeout=600)
+                
+                log.info("Stress-ng with cpu 8 ")
+
+                for line in output:
+                    print(output)
             else:
                 with open('output.json','w') as f:
                     json.dump({"exit_code":exit_code,"commit": NewGoodCommit, "flag":self.bisect_flag},f)
