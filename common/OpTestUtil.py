@@ -1398,39 +1398,46 @@ class OpTestUtil():
     
         expect_prompt = prompt + "$"
     
-        def wait_for_prompt(timeout=10):
+        def wait_for_prompt(timeout=10, exact_only=False):
             """
-            Wait for either the requested prompt, another shell/HMC prompt,
-            or an indication that the console is back at login.
+            Wait for the actual command prompt, not an echoed command.
             """
-            rc = pty.expect(
-                [
-                    expect_prompt,
+            anchored_prompt = r"(?m)^" + prompt + r"\s*$"
+        
+            patterns = [
+                anchored_prompt,
+                r"(?i)login:\s*$",
+                r"(?i)password:\s*$",
+                r"(?i)login incorrect",
+                pexpect.TIMEOUT,
+                pexpect.EOF,
+            ]
+        
+            if not exact_only:
+                patterns.insert(
+                    1,
                     r"(?m)^[^\r\n]*[#$>]\s*$",
-                    r"(?i)login:\s*$",
-                    r"(?i)password:\s*$",
-                    r"(?i)login incorrect",
-                    pexpect.TIMEOUT,
-                    pexpect.EOF,
-                ],
-                timeout=timeout,
-            )
-    
-            if rc in (0, 1):
+                )
+        
+            rc = pty.expect(patterns, timeout=timeout)
+        
+            if rc == 0:
                 return "prompt"
-    
-            if rc == 2:
+        
+            if not exact_only and rc == 1:
+                return "prompt"
+        
+            offset = 1 if exact_only else 2
+        
+            if rc == offset:
                 return "login"
-    
-            if rc == 3:
+            if rc == offset + 1:
                 return "password"
-    
-            if rc == 4:
+            if rc == offset + 2:
                 return "authentication_failed"
-    
-            if rc == 5:
+            if rc == offset + 3:
                 return "timeout"
-    
+        
             return "eof"
     
         def configure_prompt():
@@ -1440,7 +1447,7 @@ class OpTestUtil():
             """
             # Generate fresh output rather than relying on stale pexpect data.
             pty.sendline()
-            state = wait_for_prompt(timeout=10)
+            state = wait_for_prompt(timeout=10, exact_only=True)
     
             if state != "prompt":
                 log.warning(
