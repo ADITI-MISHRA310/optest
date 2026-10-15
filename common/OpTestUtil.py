@@ -1461,7 +1461,7 @@ class OpTestUtil():
             # Start Bash when available. HMC may not provide Bash, so do not
             # treat the absence of Bash as a fatal error by itself.
             pty.sendline("which bash && exec bash --norc --noprofile")
-            state = wait_for_prompt(timeout=10)
+            state = wait_for_prompt(timeout=10, exact_only=True)
     
             if state != "prompt":
                 log.warning(
@@ -1474,7 +1474,7 @@ class OpTestUtil():
     
             # Set the requested OpTest prompt.
             pty.sendline("PS1=" + prompt)
-            state = wait_for_prompt(timeout=10)
+            state = wait_for_prompt(timeout=10, exact_only=True)
     
             if state not in ("prompt",):
                 log.warning(
@@ -1489,7 +1489,7 @@ class OpTestUtil():
                 "which stty && stty cols 300; "
                 "which stty && stty rows 30"
             )
-            state = wait_for_prompt(timeout=10)
+            state = wait_for_prompt(timeout=10, exact_only=True)
     
             if state != "prompt":
                 log.warning(
@@ -1503,7 +1503,7 @@ class OpTestUtil():
             # Mambo may echo output twice.
             if term_obj.system.disable_stty_echo():
                 pty.sendline("which stty && stty -echo")
-                state = wait_for_prompt(timeout=10)
+                state = wait_for_prompt(timeout=10, exact_only=True)
     
                 if state != "prompt":
                     log.warning(
@@ -1515,7 +1515,7 @@ class OpTestUtil():
                     return False
     
             pty.sendline("export LANG=C")
-            state = wait_for_prompt(timeout=10)
+            state = wait_for_prompt(timeout=10, exact_only=True)
     
             if state != "prompt":
                 log.warning(
