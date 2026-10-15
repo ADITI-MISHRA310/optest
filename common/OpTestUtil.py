@@ -1383,91 +1383,181 @@ class OpTestUtil():
                 log.debug("OpTestSystem unable to dump firmware versions tested")
 
     def set_PS1(self, term_obj, pty, prompt):
-        # prompt comes in as the string desired, needs to be pre-built
-        # on success caller is returned 1, otherwise exception thrown
-        # order of execution and commands are sensitive here to provide reliability
+        """
+        Set the shell prompt to the OpTest prompt.
+    
+        Return 1 on success, -1 if setup is disabled in quiet mode.
+        Raise ConsoleSettings if setup fails and quiet mode is disabled.
+        """
+    
         if term_obj.setup_term_disable == 1:
             return -1
+    
         expect_prompt = prompt + "$"
-        pty.sendline("which bash && exec bash --norc --noprofile")
-        time.sleep(0.2)
-        pty.sendline('PS1=' + prompt)
-        time.sleep(0.2)
-        rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-        pty.sendline("which stty && stty cols 300;which stty && stty rows 30")
-        time.sleep(0.2)
-        rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-        # mambo echos twice so turn off
-        if term_obj.system.disable_stty_echo():
-            pty.sendline("which stty && stty -echo")
+    
+        def wait_for_shell(p, timeout=10):
+            """
+            Wait for the requested prompt or a recognizable shell prompt.
+            Return True if a shell prompt is detected, otherwise False.
+            """
+            rc = p.expect(
+                [
+                    expect_prompt,
+                    r"(?m)^[^\r\n]*[#$]\s*$",
+                    pexpect.TIMEOUT,
+                    pexpect.EOF,
+                    r"(?i)login:\s*$",
+                    r"(?i)password:\s*$",
+                    r"(?i)login incorrect",
+                ],
+                timeout=timeout,
+            )
+    
+            if rc == 0:
+                return True
+    
+            if rc == 1:
+                # A shell-like prompt was detected, but it is not yet
+                # necessarily the requested OpTest prompt.
+                return True
+    
+            if rc in [4, 5, 6]:
+                log.warning(
+                    "Console is not at a shell prompt; matched response: %r",
+                    p.after,
+                )
+    
+            return False
+    
+        def configure_prompt(p):
+            """
+            Configure PS1 only after confirming that the console is at a shell.
+            Return True on success.
+            """
+    
+            # Do not send shell commands if the console is at login/password.
+            if not wait_for_shell(p, timeout=10):
+                log.warning(
+                    "Console did not reach a shell prompt before PS1 setup"
+                )
+                return False
+    
+            # Start a clean Bash shell. Check that it actually starts.
+            p.sendline("which bash && exec bash --norc --noprofile")
+            if not wait_for_shell(p, timeout=10):
+                log.warning("Could not start Bash during console setup")
+                return False
+    
+            # Set the requested prompt.
+            p.sendline("PS1=" + prompt)
+            if not wait_for_shell(p, timeout=10):
+                log.warning("Could not set the requested shell prompt")
+                return False
+    
+            # Configure terminal dimensions.
+            p.sendline(
+                "which stty && stty cols 300; "
+                "which stty && stty rows 30"
+            )
+            if not wait_for_shell(p, timeout=10):
+                log.warning("Could not configure terminal dimensions")
+                return False
+    
+            # Some systems echo terminal output twice.
+            if term_obj.system.disable_stty_echo():
+                p.sendline("which stty && stty -echo")
+                if not wait_for_shell(p, timeout=10):
+                    log.warning("Could not disable terminal echo")
+                    return False
+    
+            # Use a predictable locale.
+            p.sendline("export LANG=C")
+            if not wait_for_shell(p, timeout=10):
+                log.warning("Could not configure the terminal locale")
+                return False
+    
+            # Synchronize console buffers.
+            p.sendline()
             time.sleep(0.2)
-            rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-        pty.sendline("export LANG=C")
-        rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-        time.sleep(0.2)
-        pty.sendline()  # needed to sync buffers later on
-        # pause for first time setup, buffers you know, more sensitive in petitboot shell, pexpect or console buffer not sure
-        time.sleep(0.2)
-        rc = pty.expect(
-            [expect_prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-        if rc == 0:
+    
+            rc = p.expect(
+                [expect_prompt, pexpect.TIMEOUT, pexpect.EOF],
+                timeout=10,
+            )
+    
+            if rc == 0:
+                return True
+    
+            log.warning(
+                "Expected OpTest prompt was not detected after setup. "
+                "Console output: %r",
+                p.before,
+            )
+            return False
+    
+        # First attempt on the existing console.
+        if configure_prompt(pty):
             log.debug("Shell prompt changed")
             self.get_versions(term_obj, pty, expect_prompt)
-            return 1  # caller needs to save state
-        else:  # we don't seem to have anything so try to get something
-            term_obj.close()
-            try:
-                # special case to allow calls back to connect which is where we probably came from
-                self.orig_system_setup_term = term_obj.get_system_setup_term()
-                self.orig_block_setup_term = term_obj.get_block_setup_term()
-                # block so the new connect will not try to come back here
-                term_obj.set_system_setup_term(1)
-                # block so the new connect will not try to come back here
-                term_obj.set_block_setup_term(1)
-                # if try_recover bails we leave things blocked, they'll get reset
-                self.try_recover(term_obj, counter=3)
-                # if we get back here we have a new prompt and unknown console
-                # in future if state can change or block flags can change this needs revisted
-                pty = term_obj.connect()  # need a new pty since we recovered
-                term_obj.set_system_setup_term = self.orig_system_setup_term
-                term_obj.set_block_setup_term = self.orig_block_setup_term
-                pty.sendline("which bash && exec bash --norc --noprofile")
-                time.sleep(0.2)
-                pty.sendline('PS1=' + prompt)
-                time.sleep(0.2)
-                pty.sendline(
-                    "which stty && stty cols 300;which stty && stty rows 30")
-                time.sleep(0.2)
-                pty.sendline("export LANG=C")
-                time.sleep(0.2)
-                pty.sendline()  # needed to sync buffers later on
-                # pause for first time setup, buffers you know, more sensitive in petitboot shell, pexpect or console buffer not sure
-                time.sleep(0.2)
-                rc = pty.expect(
-                    [expect_prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
-                if rc == 0:
-                    log.debug("Shell prompt changed")
-                    self.get_versions(term_obj, pty, expect_prompt)
-                    return 1  # caller needs to save state
-                else:
-                    if term_obj.setup_term_quiet == 0:
-                        log.warning("OpTestSystem Change of shell prompt not completed after last final retry,"
-                                    " probably a connection issue, raised Exception ConsoleSettings but continuing")
-                        raise ConsoleSettings(before=pty.before, after=pty.after,
-                                              msg="Change of shell prompt not completed after last final retry, probably a connection issue, retry")
-                    else:
-                        term_obj.setup_term_disable = 1
-                        return -1
-            except RecoverFailed as e:
-                if term_obj.setup_term_quiet == 0:
-                    log.warning("OpTestSystem Change of shell prompt not completed after last retry,"
-                                " probably a connection issue, raised Exception ConsoleSettings but continuing")
-                    raise ConsoleSettings(before=pty.before, after=pty.after,
-                                          msg="Change of shell prompt not completed after last retry, probably a connection issue, retry")
-                else:
-                    term_obj.setup_term_disable = 1
-                    return -1
-
+            return 1
+    
+        # Initial attempt failed. Close and try console recovery.
+        term_obj.close()
+    
+        try:
+            self.orig_system_setup_term = term_obj.get_system_setup_term()
+            self.orig_block_setup_term = term_obj.get_block_setup_term()
+    
+            # Prevent recursive console setup during recovery.
+            term_obj.set_system_setup_term(1)
+            term_obj.set_block_setup_term(1)
+    
+            self.try_recover(term_obj, counter=3)
+    
+            # Reconnect after recovery.
+            pty = term_obj.connect()
+    
+            # Restore the flags using the methods, not by overwriting them.
+            term_obj.set_system_setup_term(
+                self.orig_system_setup_term
+            )
+            term_obj.set_block_setup_term(
+                self.orig_block_setup_term
+            )
+    
+            if configure_prompt(pty):
+                log.debug("Shell prompt changed after console recovery")
+                self.get_versions(term_obj, pty, expect_prompt)
+                return 1
+    
+            if term_obj.setup_term_quiet == 0:
+                log.warning(
+                    "Change of shell prompt failed after console recovery"
+                )
+                raise ConsoleSettings(
+                    before=pty.before,
+                    after=pty.after,
+                    msg=(
+                        "Change of shell prompt failed after recovery; "
+                        "check console state, login status, and credentials"
+                    ),
+                )
+    
+            term_obj.setup_term_disable = 1
+            return -1
+    
+        except RecoverFailed:
+            if term_obj.setup_term_quiet == 0:
+                log.warning("Console recovery failed during PS1 setup")
+                raise ConsoleSettings(
+                    before=getattr(pty, "before", ""),
+                    after=getattr(pty, "after", ""),
+                    msg="Console recovery failed while setting the shell prompt",
+                )
+    
+            term_obj.setup_term_disable = 1
+            return -1
+      
     def get_login(self, host, term_obj, pty, prompt):
         # prompt comes in as the string desired, needs to be pre-built
         if term_obj.setup_term_disable == 1:
