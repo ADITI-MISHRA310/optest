@@ -231,5 +231,5 @@ class InstallUpstreamKernel(unittest.TestCase):
             self.cv_HOST.host_gather_kernel_log()
 
         finally:
-            if self.console_thread.isAlive():
+            if self.console_thread.is_alive():
                 self.console_thread.console_terminate()
