@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+  #!/usr/bin/env python3
 # IBM_PROLOG_BEGIN_TAG
 # This is an automatically generated prolog.
 #
@@ -1383,396 +1383,173 @@ class OpTestUtil():
                 log.debug("OpTestSystem unable to dump firmware versions tested")
 
     def set_PS1(self, term_obj, pty, prompt):
-        """
-        Set the console prompt to the requested OpTest prompt.
-    
-        Returns:
-            1  - prompt setup succeeded
-           -1  - setup disabled or failed in quiet mode
-    
-        Raises:
-            ConsoleSettings - setup failed when quiet mode is disabled
-        """
+        # prompt comes in as the string desired, needs to be pre-built
+        # on success caller is returned 1, otherwise exception thrown
+        # order of execution and commands are sensitive here to provide reliability
         if term_obj.setup_term_disable == 1:
             return -1
-    
         expect_prompt = prompt + "$"
-    
-        def wait_for_prompt(timeout=10, exact_only=False):
-            """
-            Wait for the actual command prompt, not an echoed command.
-            """
-            anchored_prompt = r"(?m)^" + prompt + r"\s*$"
-        
-            patterns = [
-                anchored_prompt,
-                r"(?i)login:\s*$",
-                r"(?i)password:\s*$",
-                r"(?i)login incorrect",
-                pexpect.TIMEOUT,
-                pexpect.EOF,
-            ]
-        
-            if not exact_only:
-                patterns.insert(
-                    1,
-                    r"(?m)^[^\r\n]*[#$>]\s*$",
-                )
-        
-            rc = pty.expect(patterns, timeout=timeout)
-        
-            if rc == 0:
-                return "prompt"
-        
-            if not exact_only and rc == 1:
-                return "prompt"
-        
-            offset = 1 if exact_only else 2
-        
-            if rc == offset:
-                return "login"
-            if rc == offset + 1:
-                return "password"
-            if rc == offset + 2:
-                return "authentication_failed"
-            if rc == offset + 3:
-                return "timeout"
-        
-            return "eof"
-    
-        def configure_prompt():
-            """
-            Configure the prompt only after confirming the console is
-            at a shell or HMC command prompt.
-            """
-            # Generate fresh output rather than relying on stale pexpect data.
-            pty.sendline()
-            state = wait_for_prompt(timeout=10, exact_only=True)
-    
-            if state != "prompt":
-                log.warning(
-                    "Console is not at a command prompt before PS1 setup: %s; "
-                    "output=%r",
-                    state,
-                    pty.before,
-                )
-                return False
-    
-            # Start Bash when available. HMC may not provide Bash, so do not
-            # treat the absence of Bash as a fatal error by itself.
-            pty.sendline("which bash && exec bash --norc --noprofile")
-            state = wait_for_prompt(timeout=10, exact_only=True)
-    
-            if state != "prompt":
-                log.warning(
-                    "No command prompt after attempting Bash setup: %s; "
-                    "output=%r",
-                    state,
-                    pty.before,
-                )
-                return False
-    
-            # Set the requested OpTest prompt.
-            pty.sendline("PS1=" + prompt)
-            state = wait_for_prompt(timeout=10, exact_only=True)
-    
-            if state not in ("prompt",):
-                log.warning(
-                    "Could not set the requested prompt: %s; output=%r",
-                    state,
-                    pty.before,
-                )
-                return False
-    
-            # Configure terminal dimensions where stty is available.
-            pty.sendline(
-                "which stty && stty cols 300; "
-                "which stty && stty rows 30"
-            )
-            state = wait_for_prompt(timeout=10, exact_only=True)
-    
-            if state != "prompt":
-                log.warning(
-                    "No command prompt after terminal-size configuration: "
-                    "%s; output=%r",
-                    state,
-                    pty.before,
-                )
-                return False
-    
-            # Mambo may echo output twice.
-            if term_obj.system.disable_stty_echo():
-                pty.sendline("which stty && stty -echo")
-                state = wait_for_prompt(timeout=10, exact_only=True)
-    
-                if state != "prompt":
-                    log.warning(
-                        "No command prompt after stty echo configuration: "
-                        "%s; output=%r",
-                        state,
-                        pty.before,
-                    )
-                    return False
-    
-            pty.sendline("export LANG=C")
-            state = wait_for_prompt(timeout=10, exact_only=True)
-    
-            if state != "prompt":
-                log.warning(
-                    "No command prompt after locale configuration: %s; "
-                    "output=%r",
-                    state,
-                    pty.before,
-                )
-                return False
-    
-            # Synchronize the console buffers and verify the exact prompt.
-            pty.sendline()
-            rc = pty.expect(
-                [expect_prompt, pexpect.TIMEOUT, pexpect.EOF],
-                timeout=10,
-            )
-    
-            if rc == 0:
-                return True
-    
-            log.warning(
-                "Expected OpTest prompt not detected; output=%r",
-                pty.before,
-            )
-            return False
-    
-        # Initial attempt.
-        if configure_prompt():
+        pty.sendline("which bash && exec bash --norc --noprofile")
+        time.sleep(0.2)
+        pty.sendline('PS1=' + prompt)
+        time.sleep(0.2)
+        rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        pty.sendline("which stty && stty cols 300;which stty && stty rows 30")
+        time.sleep(0.2)
+        rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        # mambo echos twice so turn off
+        if term_obj.system.disable_stty_echo():
+            pty.sendline("which stty && stty -echo")
+            time.sleep(0.2)
+            rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        pty.sendline("export LANG=C")
+        rc = pty.expect([prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        time.sleep(0.2)
+        pty.sendline()  # needed to sync buffers later on
+        # pause for first time setup, buffers you know, more sensitive in petitboot shell, pexpect or console buffer not sure
+        time.sleep(0.2)
+        rc = pty.expect(
+            [expect_prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+        if rc == 0:
             log.debug("Shell prompt changed")
             self.get_versions(term_obj, pty, expect_prompt)
-            return 1
-    
-        # Recovery attempt.
-        term_obj.close()
-    
-        try:
-            self.orig_system_setup_term = term_obj.get_system_setup_term()
-            self.orig_block_setup_term = term_obj.get_block_setup_term()
-    
-            term_obj.set_system_setup_term(1)
-            term_obj.set_block_setup_term(1)
-    
-            self.try_recover(term_obj, counter=3)
-    
-            pty = term_obj.connect()
-    
-            # Restore the flags by calling the methods, not overwriting them.
-            term_obj.set_system_setup_term(
-                self.orig_system_setup_term
-            )
-            term_obj.set_block_setup_term(
-                self.orig_block_setup_term
-            )
-    
-            if configure_prompt():
-                log.debug("Shell prompt changed after console recovery")
-                self.get_versions(term_obj, pty, expect_prompt)
-                return 1
-    
-            if term_obj.setup_term_quiet == 0:
-                raise ConsoleSettings(
-                    before=pty.before,
-                    after=pty.after,
-                    msg=(
-                        "Prompt setup failed after console recovery. "
-                        "Check authentication and console synchronization."
-                    ),
-                )
-    
-            term_obj.setup_term_disable = 1
-            return -1
-    
-        except RecoverFailed:
-            if term_obj.setup_term_quiet == 0:
-                raise ConsoleSettings(
-                    before=getattr(pty, "before", ""),
-                    after=getattr(pty, "after", ""),
-                    msg="Console recovery failed during prompt setup",
-                )
-    
-            term_obj.setup_term_disable = 1
-            return -1
-    
-    
+            return 1  # caller needs to save state
+        else:  # we don't seem to have anything so try to get something
+            term_obj.close()
+            try:
+                # special case to allow calls back to connect which is where we probably came from
+                self.orig_system_setup_term = term_obj.get_system_setup_term()
+                self.orig_block_setup_term = term_obj.get_block_setup_term()
+                # block so the new connect will not try to come back here
+                term_obj.set_system_setup_term(1)
+                # block so the new connect will not try to come back here
+                term_obj.set_block_setup_term(1)
+                # if try_recover bails we leave things blocked, they'll get reset
+                self.try_recover(term_obj, counter=3)
+                # if we get back here we have a new prompt and unknown console
+                # in future if state can change or block flags can change this needs revisted
+                pty = term_obj.connect()  # need a new pty since we recovered
+                term_obj.set_system_setup_term = self.orig_system_setup_term
+                term_obj.set_block_setup_term = self.orig_block_setup_term
+                pty.sendline("which bash && exec bash --norc --noprofile")
+                time.sleep(0.2)
+                pty.sendline('PS1=' + prompt)
+                time.sleep(0.2)
+                pty.sendline(
+                    "which stty && stty cols 300;which stty && stty rows 30")
+                time.sleep(0.2)
+                pty.sendline("export LANG=C")
+                time.sleep(0.2)
+                pty.sendline()  # needed to sync buffers later on
+                # pause for first time setup, buffers you know, more sensitive in petitboot shell, pexpect or console buffer not sure
+                time.sleep(0.2)
+                rc = pty.expect(
+                    [expect_prompt, pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                if rc == 0:
+                    log.debug("Shell prompt changed")
+                    self.get_versions(term_obj, pty, expect_prompt)
+                    return 1  # caller needs to save state
+                else:
+                    if term_obj.setup_term_quiet == 0:
+                        log.warning("OpTestSystem Change of shell prompt not completed after last final retry,"
+                                    " probably a connection issue, raised Exception ConsoleSettings but continuing")
+                        raise ConsoleSettings(before=pty.before, after=pty.after,
+                                              msg="Change of shell prompt not completed after last final retry, probably a connection issue, retry")
+                    else:
+                        term_obj.setup_term_disable = 1
+                        return -1
+            except RecoverFailed as e:
+                if term_obj.setup_term_quiet == 0:
+                    log.warning("OpTestSystem Change of shell prompt not completed after last retry,"
+                                " probably a connection issue, raised Exception ConsoleSettings but continuing")
+                    raise ConsoleSettings(before=pty.before, after=pty.after,
+                                          msg="Change of shell prompt not completed after last retry, probably a connection issue, retry")
+                else:
+                    term_obj.setup_term_disable = 1
+                    return -1
+
     def get_login(self, host, term_obj, pty, prompt):
-        """
-        Log in to the guest console if required, then configure its prompt.
-    
-        Returns:
-            (PS1_set, LOGIN_set)
-        """
+        # prompt comes in as the string desired, needs to be pre-built
         if term_obj.setup_term_disable == 1:
             return -1, -1
-    
         my_user = host.username()
         my_pwd = host.password()
-    
-        def fail_login(message):
-            """Apply the existing quiet-mode behavior for login failures."""
-            if term_obj.setup_term_quiet == 0:
-                log.warning("%s", message)
-                raise ConsoleSettings(
-                    before=getattr(pty, "before", ""),
-                    after=getattr(pty, "after", ""),
-                    msg=message,
-                )
-    
-            term_obj.setup_term_disable = 1
-            return -1, -1
-    
-        def wait_for_shell(timeout=100):
-            """
-            Wait for a command prompt after authentication.
-    
-            A 'Last login' banner is deliberately not considered proof of
-            successful login. Only a subsequent command prompt is accepted.
-            """
-            rc = pty.expect(
-                [
-                    r"(?i)login incorrect",
-                    r"(?i)authentication failure",
-                    r"(?i)login:\s*$",
-                    r"(?i)password:\s*$",
-                    r"(?m)^[^\r\n]*[#$>]\s*$",
-                    pexpect.TIMEOUT,
-                    pexpect.EOF,
-                ],
-                timeout=timeout,
-            )
-    
-            if rc == 4:
-                log.debug(
-                    "Console command prompt detected after login: %r",
-                    pty.after,
-                )
-                return True
-    
-            log.warning(
-                "Guest console did not reach a command prompt; "
-                "expect index=%s, output=%r",
-                rc,
-                pty.after,
-            )
-            return False
-    
-        # Wake the console and identify its current state.
         pty.sendline()
-    
-        rc = pty.expect(
-            [
-                r"(?i)login:\s*$",
-                r"Last login",
-                r"(?m)^[^\r\n]*[#$>]\s*$",
-                pexpect.TIMEOUT,
-                pexpect.EOF,
-            ],
-            timeout=180,
-        )
-    
+        rc = pty.expect(['login: ', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
         if rc == 0:
-            # A login prompt means authentication is required.
             pty.sendline(my_user)
-    
+            time.sleep(0.1)
             rc = pty.expect(
-                [
-                    r"(?i)password:\s*$",
-                    r"(?i)login:\s*$",
-                    pexpect.TIMEOUT,
-                    pexpect.EOF,
-                ],
-                timeout=60,
-            )
-    
-            if rc != 0:
-                result = fail_login(
-                    "Guest console did not present a password prompt"
-                )
-                return result
-    
-            pty.sendline(my_pwd)
-    
-            # Crucial fix: do not treat a 'Last login' banner as success.
-            if not wait_for_shell(timeout=100):
-                result = fail_login(
-                    "Guest authentication failed or no command prompt "
-                    "appeared after login"
-                )
-                return result
-    
-        elif rc == 1:
-            # The banner may appear before the actual shell prompt.
-            if not wait_for_shell(timeout=60):
-                result = fail_login(
-                    "Login banner appeared, but no command prompt followed"
-                )
-                return result
-    
-        elif rc == 2:
-            # Already at a command prompt; no login is needed.
-            log.debug("Console already has a command prompt")
-    
-        else:
-            # Initial output was inconclusive. Try once more to distinguish
-            # an existing shell from a login prompt.
+                [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+            if rc == 0:
+                pty.sendline(my_pwd)
+                time.sleep(0.5)
+                rc = pty.expect(['login: $', ".*#$", ".*# $", ".*\$", "~ #",
+                                 'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=60)
+                if rc not in [1, 2, 3, 4]:
+                    if term_obj.setup_term_quiet == 0:
+                        log.warning("OpTestSystem Problem with the login and/or password prompt,"
+                                    " raised Exception ConsoleSettings but continuing")
+                        raise ConsoleSettings(before=pty.before, after=pty.after,
+                                              msg="Problem with the login and/or password prompt, probably a connection or credential issue, retry")
+                    else:
+                        term_obj.setup_term_disable = 1
+                        return -1, -1
+            else:
+                if term_obj.setup_term_quiet == 0:
+                    log.warning(
+                        "OpTestSystem Problem with the login and/or password prompt, raised Exception ConsoleSettings but continuing")
+                    raise ConsoleSettings(before=pty.before, after=pty.after,
+                                          msg="Problem with the login and/or password prompt, probably a connection or credential issue, retry")
+                else:
+                    term_obj.setup_term_disable = 1
+                    return -1, -1
+            my_PS1_set = self.set_PS1(term_obj, pty, prompt)
+            my_LOGIN_set = 1
+        else:  # timeout eof
             pty.sendline()
-    
             rc = pty.expect(
-                [
-                    r"(?i)login:\s*$",
-                    r"(?m)^[^\r\n]*[#$>]\s*$",
-                    pexpect.TIMEOUT,
-                    pexpect.EOF,
-                ],
-                timeout=60,
-            )
-    
+                ['login: ', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
             if rc == 0:
                 pty.sendline(my_user)
-    
+                time.sleep(0.1)
                 rc = pty.expect(
-                    [
-                        r"(?i)password:\s*$",
-                        pexpect.TIMEOUT,
-                        pexpect.EOF,
-                    ],
-                    timeout=60,
-                )
-    
-                if rc != 0:
-                    result = fail_login(
-                        "No password prompt after sending the guest username"
-                    )
-                    return result
-    
-                pty.sendline(my_pwd)
-    
-                if not wait_for_shell(timeout=100):
-                    result = fail_login(
-                        "Guest authentication failed or no command prompt "
-                        "appeared after login"
-                    )
-                    return result
-    
-            elif rc == 1:
-                log.debug("Console command prompt detected on retry")
-    
-            else:
-                result = fail_login(
-                    "Could not identify a guest login prompt or command prompt"
-                )
-                return result
-    
-        # Only reach this point after detecting a command prompt.
-        my_PS1_set = self.set_PS1(term_obj, pty, prompt)
-        my_LOGIN_set = 1
-    
-        return my_PS1_set, my_LOGIN_set
+                    [r"[Pp]assword:", pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                if rc == 0:
+                    pty.sendline(my_pwd)
+                    time.sleep(0.5)
+                    rc = pty.expect(['login: $', ".*#$", ".*# $", ".*\$", "~ #",
+                                     'Petitboot', pexpect.TIMEOUT, pexpect.EOF], timeout=10)
+                    if rc not in [1, 2, 3, 4]:
+                        if term_obj.setup_term_quiet == 0:
+                            log.warning("OpTestSystem Problem with the login and/or password prompt,"
+                                        " raised Exception ConsoleSettings but continuing")
+                            raise ConsoleSettings(before=pty.before, after=pty.after,
+                                                  msg="Problem with the login and/or password prompt, probably a connection or credential issue, retry")
+                        else:
+                            term_obj.setup_term_disable = 1
+                            return -1, -1
+                else:
+                    if term_obj.setup_term_quiet == 0:
+                        log.warning("OpTestSystem Problem with the login and/or password prompt after a secondary connection issue,"
+                                    " raised Exception ConsoleSettings but continuing")
+                        raise ConsoleSettings(before=pty.before, after=pty.after,
+                                              msg="Problem with the login and/or password prompt after a secondary connection or credential issue, retry")
+                    else:
+                        term_obj.setup_term_disable = 1
+                        return -1, -1
+                my_PS1_set = self.set_PS1(term_obj, pty, prompt)
+                my_LOGIN_set = 1
+            else:  # timeout eof
+                if term_obj.setup_term_quiet == 0:
+                    log.warning("OpTestSystem Problem with the login and/or password prompt after a previous connection issue,"
+                                " raised Exception ConsoleSettings but continuing")
+                    raise ConsoleSettings(before=pty.before, after=pty.after,
+                                          msg="Problem with the login and/or password prompt last try, probably a connection or credential issue, retry")
+                else:
+                    term_obj.setup_term_disable = 1
+                    return -1, -1
+        return my_PS1_set, my_LOGIN_set  # caller needs to save state
 
     def check_root(self, pty, prompt):
         # we do the best we can to verify, but if not oh well
