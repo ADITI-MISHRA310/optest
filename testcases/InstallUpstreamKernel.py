@@ -115,7 +115,7 @@ class InstallUpstreamKernel(unittest.TestCase):
             con.run_command("make %s" % self.config)
             log.debug("Compile and install linux kernel")
             
-              con.run_command(
+            con.run_command(
                 "cd %s && make -j %d -s && make modules && make modules_install && make install"
                 % (linux_path, onlinecpus), timeout=self.host_cmd_timeout)
 
