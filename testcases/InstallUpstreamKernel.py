@@ -80,11 +80,26 @@ class InstallUpstreamKernel(unittest.TestCase):
         self.console_thread.start()
         try:
             con = self.cv_SYSTEM.cv_HOST.get_ssh_connection()
+            
+            # Capture original kernel information BEFORE installing upstream kernel
+            original_running_kernel = con.run_command("uname -r")[-1].strip()
+
+            if self.host_distro_name in ['rhel', 'Red Hat', 'ubuntu', 'Ubuntu',
+                                 'sles', 'SLES']:
+                original_default_kernel = con.run_command(
+                        "grubby --default-kernel")[-1].strip()
+            else:
+                raise self.skipTest("Unsupported OS")
+
+            log.info("Original running kernel: %s", original_running_kernel)
+            log.info("Original default kernel: %s", original_default_kernel)
+
             try:
                 onlinecpus = int(con.run_command(
                     "lscpu --online -e|wc -l")[-1])
             except Exception:
                 onlinecpus = 20
+            
             log.debug("Downloading linux kernel")
             # Compile and install given kernel
             linux_path = os.path.join(self.home, "linux")
