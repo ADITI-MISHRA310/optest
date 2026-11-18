@@ -85,14 +85,18 @@ class InstallUpstreamKernel(unittest.TestCase):
             original_running_kernel = con.run_command("uname -r")[-1].strip()
 
             # Detect target OS
+            
             os_info = con.run_command(
-                        "cat /etc/os-release")[-1]
+                                "source /etc/os-release && echo $ID")[-1].strip().strip('"')
 
-            if "ID=rhel" in os_info or "ID=sles" in os_info or "ID=ubuntu" in os_info:
+            log.info("Detected target OS: %s", os_info)
+
+            if os_info in ['rhel', 'sles', 'ubuntu']:
                 original_default_kernel = con.run_command(
-                                        "grubby --default-kernel")[-1].strip()
+                            "grubby --default-kernel")[-1].strip()
             else:
-                raise self.skipTest("Unsupported OS")
+                raise self.skipTest("Unsupported OS: %s" % os_info)
+
 
             log.info("Original running kernel: %s", original_running_kernel)
             log.info("Original default kernel: %s", original_default_kernel)
