@@ -48,7 +48,7 @@ class InstallUpstreamKernel(unittest.TestCase):
         self.config = self.conf.args.git_repoconfig
         self.config_path = self.conf.args.git_repoconfigpath
         self.disk = self.conf.args.host_scratch_disk
-        self.patch = self.conf.args.git_patch
+        self.msg_id = self.conf.args.message_id
         self.use_kexec = self.conf.args.use_kexec
         self.append_kernel_cmdline = self.conf.args.append_kernel_cmdline
         if self.config_path:
@@ -117,23 +117,49 @@ class InstallUpstreamKernel(unittest.TestCase):
             con.run_command("cd %s && git clone --depth 1  %s -b %s linux" %
                             (self.home, self.repo, self.branch), timeout=self.host_cmd_timeout)
             con.run_command("cd %s" % linux_path)
-            if self.patch:
-                patch_file = self.patch.split("/")[-1]
-                if is_url(self.patch):
-                    con.run_command("wget %s -O %s" % (self.patch, patch_file))
-                else:
-                    self.cv_HOST.copy_test_file_to_host(
-                        self.patch, dstdir=linux_path)
-                log.debug("Applying given patch")
-                con.run_command("git am %s" %
-                                os.path.join(linux_path, patch_file))
+            
+            if self.msg_id:
+                log.debug("Getting the patches")
+
+                con.run_command("rm -rf .git/rebase-apply")
+                con.run_command("rm -rf patches")
+                con.run_command("mkdir -p patches")
+
+                msg_ids = self.msg_id.split()
+
+                for msg_id in msg_ids:
+                    log.debug("Getting patch: %s", msg_id)
+
+                    con.run_command(
+                            "b4 am %s --outdir patches" % msg_id, timeout=120)
+
+                log.debug("Applying the patches")
+                con.run_command("git am patches/*.mbx")
+            
             log.debug("Downloading linux kernel config")
+            
+            if self.config_path:
+                if is_url(self.config_path):
+                    con.run_command("wget %s -O .config" % self.config_path)
+            
+            con.run_command("cp /boot/config-6.12.0-136.el10.ppc64le .config")
+
+            if self.msg_id:
+                #con.run_command('echo "CONFIG_LOCALVERSION=\\"-%s\\"" >> .config' % self.msg_id)
+
+                max_len = 40   # keep safely below kernel 64 limit
+                local_ver = self.msg_id[:max_len]
+
+                con.run_command('echo "CONFIG_LOCALVERSION=\\"-%s\\"" >> .config' % local_ver)
+            
             if self.config_path:
                 if is_url(self.config_path):
                     con.run_command("wget %s -O .config" % self.config_path)
                 else:
                     self.cv_HOST.copy_test_file_to_host(
                         self.config_path, dstdir=os.path.join(linux_path, ".config"))
+           
+            
             con.run_command("make %s" % self.config)
             log.debug("Compile and install linux kernel")
             
