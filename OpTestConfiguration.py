@@ -353,6 +353,8 @@ def get_parser():
                           help="bisect test script that classifies the commit as good or bad", default=None)
     gitgroup.add_argument("--bisect-category",
                           help="bisect category (build, test)", default=None)
+    gitgroup.add_argument(
+        "--message-id", help="Message ID of upstream patch", default=None)
 
     imagegroup = parser.add_argument_group(
         'Images', 'Firmware LIDs/images to flash')
