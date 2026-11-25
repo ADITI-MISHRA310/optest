@@ -117,7 +117,8 @@ class InstallUpstreamKernel(unittest.TestCase):
             con.run_command("cd %s && git clone --depth 1  %s -b %s linux" %
                             (self.home, self.repo, self.branch), timeout=self.host_cmd_timeout)
             con.run_command("cd %s" % linux_path)
-            
+            con.run_command("make ppc64le_defconfig", timeout=120)
+
             if self.msg_id:
                 log.debug("Getting the patches")
 
@@ -136,14 +137,6 @@ class InstallUpstreamKernel(unittest.TestCase):
                 log.debug("Applying the patches")
                 con.run_command("git am patches/*.mbx")
             
-            log.debug("Downloading linux kernel config")
-            
-            if self.config_path:
-                if is_url(self.config_path):
-                    con.run_command("wget %s -O .config" % self.config_path)
-            
-            con.run_command("cp /boot/config-6.12.0-136.el10.ppc64le .config")
-
             if self.msg_id:
                 #con.run_command('echo "CONFIG_LOCALVERSION=\\"-%s\\"" >> .config' % self.msg_id)
 
