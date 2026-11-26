@@ -164,10 +164,11 @@ class InstallUpstreamKernel(unittest.TestCase):
             
             if not self.use_kexec:
                 # FIXME: Handle distributions which do not support grub
+                
                 con.run_command(
-                    'grubby --set-default /boot/vmlinuz-%s'
-                    % expected_kernel
-                )
+                    'grubby --update-kernel=/boot/vmlinuz-%s '
+                    '--args="%s"'
+                            % (expected_kernel, self.append_kernel_cmdline))
 
                 con.run_command(
                     "grub2-mkconfig --output=/boot/grub2/grub.cfg"
